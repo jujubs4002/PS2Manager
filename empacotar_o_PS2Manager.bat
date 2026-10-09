@@ -1,0 +1,12 @@
+py -m PyInstaller ^
+  --noconfirm ^
+  --onefile ^
+  --windowed ^
+  --icon "icon.ico" ^
+  --add-data "sounds;sounds" ^
+  --add-data "scripts;scripts" ^
+  --copy-metadata customtkinter ^
+  --hidden-import pygame ^
+  --hidden-import customtkinter ^
+  --hidden-import psutil ^
+  --name "PS2Manager" ps2manager.py ^
