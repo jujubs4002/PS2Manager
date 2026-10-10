@@ -1,0 +1,1 @@
+PS2Manager is a Windows program that aims to bring all kinds of PS2 tools together into a single application. It currently includes USBUtil, APA HDD support (which is not perfect yet), and many other features. PS2Manager is still under development, so many bugs are expected.
