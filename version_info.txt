@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 1, 0, 0),
-    prodvers=(2, 1, 0, 0),
+    filevers=(2, 1, 7, 0),
+    prodvers=(2, 1, 7, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'jujubs_4002'),
             StringStruct('FileDescription', 'PS2Manager - OPL & PS2 Library Manager'),
-            StringStruct('FileVersion', '1.05'),
+            StringStruct('FileVersion', '1.07'),
             StringStruct('InternalName', 'ps2manager'),
             StringStruct('LegalCopyright', 'Copyright (C) 2026 jujubs_4002'),
             StringStruct('OriginalFilename', 'ps2manager.exe'),
             StringStruct('ProductName', 'PS2Manager'),
-            StringStruct('ProductVersion', '1.05')
+            StringStruct('ProductVersion', '1.07')
           ]
         )
       ]

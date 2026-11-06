@@ -33,6 +33,7 @@ py -m PyInstaller ^
   --add-data "scripts;scripts" ^
   --add-data "DO NOT DELETE DATA.JSON.txt;." ^
   --add-data "version.txt;." ^
+  --add-data "icon.ico;." ^
   --copy-metadata customtkinter ^
   --name "Installer_PS2Manager" ^
   custom_installer.py

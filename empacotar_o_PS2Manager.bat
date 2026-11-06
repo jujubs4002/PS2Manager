@@ -9,4 +9,4 @@ py -m PyInstaller ^
   --hidden-import pygame ^
   --hidden-import customtkinter ^
   --hidden-import psutil ^
-  --name "PS2Manager" ps2manager.py ^
+  --name "PS2Manager" ps2manager.py

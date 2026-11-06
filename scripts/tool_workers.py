@@ -1,0 +1,1073 @@
+import os
+import sys
+import time
+import re
+import threading
+import shutil
+import psutil
+import subprocess
+import ctypes
+import struct
+import zlib
+import urllib.request
+import urllib.error
+import customtkinter as ctk
+
+from scripts.core_backend import (
+    sys_logger, APP_DATA_DIR, BASE_DIR, MEIPASS_DIR, get_res_path,
+    cfg, t, format_size, TransferLockManager, GameAnalyzer, db, sound_fx,
+    LZ4_SUPPORT, PYCDLIB_SUPPORT, WIN32COM_SUPPORT, SOUND_SUPPORT, PYGAME_SUPPORT
+)
+
+class APAManager:
+    @staticmethod
+    def list_physical_drives():
+        drives = []
+        try:
+            ps_cmd = 'powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-CimInstance Win32_DiskDrive | ForEach-Object { \\\"$($_.DeviceID)|$($_.Size)|$($_.Model)\\\" }"'
+            res = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if res.returncode == 0 and res.stdout.strip():
+                for line in res.stdout.strip().split('\n'):
+                    parts = line.strip().split('|')
+                    if len(parts) >= 3:
+                        dev_id, sz, model = parts[0], parts[1], parts[2]
+                        try:
+                            drives.append(f"{dev_id} ({format_size(int(sz))}) - {model}")
+                        except Exception:
+                            drives.append(f"{dev_id} - {model}")
+                if drives:
+                    return drives
+        except Exception:
+            pass
+
+        try:
+            out = subprocess.check_output(
+                'wmic diskdrive get Name, Size, Model /value',
+                shell=True,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            ).decode(errors='ignore')
+            current = {}
+            for line in out.strip().split('\n'):
+                line = line.strip()
+                if not line:
+                    if 'Name' in current and 'Size' in current and 'Model' in current:
+                        try:
+                            drives.append(f"{current['Name']} ({format_size(int(current['Size']))}) - {current['Model']}")
+                        except Exception:
+                            pass
+                    current = {}
+                else:
+                    parts = line.split('=', 1)
+                    if len(parts) == 2:
+                        current[parts[0]] = parts[1]
+            if current and 'Name' in current and 'Size' in current:
+                drives.append(f"{current['Name']} ({format_size(int(current['Size']))}) - {current.get('Model', '')}")
+        except Exception:
+            pass
+        return drives
+
+    @staticmethod
+    def create_fake_vhd():
+        desktop = os.path.join(os.environ.get("USERPROFILE", "C:\\"), "Desktop")
+        filepath = os.path.join(desktop, "Fake_PS2_HDD.img")
+        try:
+            with open(filepath, 'wb') as f:
+                f.truncate(1024 * 1024 * 1024)
+                def write_apa(offset, part_id, ptype):
+                    f.seek(offset)
+                    part_id_bytes = part_id.encode('utf-8').ljust(32, b'\x00')
+                    header = struct.pack('<I 4s I I 32s 8s I I', 0, b'APA\x00', 0, 0, part_id_bytes, b'', 0, ptype)
+                    f.write(header)
+                write_apa(0, "__mbr", 0x0000)
+                write_apa(134217728, "+OPL", 0x0001)
+                f.seek(134217728 + 1024)
+                f.write(b"DIR: ART\nDIR: APPS\nDIR: CFG\nFILE: ART/SLUS_209.46_COV.png\n")
+                write_apa(268435456, "PP.HDL.Crash_Bandicoot", 0x0100)
+                write_apa(536870912, "PP.HDL.God_of_War_II", 0x0100)
+            return filepath
+        except Exception:
+            return None
+
+    @staticmethod
+    def read_apa_partitions(drive_path):
+        partitions = []
+        try:
+            with open(drive_path, 'rb') as f:
+                for i in range(0, 4096):
+                    offset = i * 134217728
+                    try:
+                        f.seek(offset)
+                        header = f.read(1024)
+                    except IOError:
+                        break
+                    if not header or len(header) < 64:
+                        break
+                    if header[4:8] in [b'APA\x00', b'APA ', b'APA\x01']:
+                        part_id = header[16:48].decode('utf-8', 'ignore').strip('\x00')
+                        part_type = struct.unpack('<I', header[60:64])[0]
+                        length_sectors = 0
+                        try:
+                            length_sectors = struct.unpack('<I', header[8:12])[0]
+                        except Exception:
+                            pass
+                        real_size_bytes = (length_sectors * 512) if length_sectors > 0 else (4 * 1024 * 1024 * 1024 if part_type == 0x0100 else 134217728)
+                        partitions.append({
+                            "id": part_id,
+                            "offset": offset,
+                            "type": part_type,
+                            "size_bytes": real_size_bytes,
+                            "size_str": format_size(real_size_bytes),
+                            "is_game": part_id.startswith("PP.HDL.")
+                        })
+        except Exception:
+            pass
+        return partitions
+
+    @staticmethod
+    def get_raw_size(source):
+        if source.startswith("\\\\.\\"):
+            clean_id = source.replace('\\', '\\\\')
+            try:
+                ps_cmd = f'powershell -NoProfile -ExecutionPolicy Bypass -Command "(Get-CimInstance Win32_DiskDrive | Where-Object DeviceID -eq \'{source}\').Size"'
+                res = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                if res.returncode == 0 and res.stdout.strip().isdigit():
+                    return int(res.stdout.strip())
+            except Exception:
+                pass
+            try:
+                out = subprocess.check_output(
+                    f'wmic diskdrive where DeviceID="{clean_id}" get Size /value',
+                    shell=True,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                ).decode()
+                for line in out.split('\n'):
+                    if "Size=" in line:
+                        return int(line.split('=')[1].strip())
+            except Exception:
+                return 500 * 1024 * 1024 * 1024
+        else:
+            return os.path.getsize(source)
+        return 0
+
+    @staticmethod
+    def backup_raw(source, dest, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire("Backup APA Raw")
+            try:
+                if source.startswith("\\\\.\\"):
+                    try:
+                        open(source, 'rb').close()
+                    except PermissionError:
+                        return cb_err("Permission Denied! Run as Administrator.")
+                total_size = APAManager.get_raw_size(source)
+                copied = 0
+                with open(source, 'rb') as f_src, open(dest, 'wb') as f_dst:
+                    while True:
+                        buf = f_src.read(4 * 1024 * 1024)
+                        if not buf:
+                            break
+                        f_dst.write(buf)
+                        copied += len(buf)
+                        if total_size > 0:
+                            cb_prog(min(copied / total_size, 1.0))
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def restore_raw(img_source, dest, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire("Restauração APA Raw")
+            try:
+                if dest.startswith("\\\\.\\"):
+                    try:
+                        open(dest, 'wb').close()
+                    except PermissionError:
+                        return cb_err("Permission Denied! Run as Administrator.")
+                total_size = APAManager.get_raw_size(img_source)
+                copied = 0
+                with open(img_source, 'rb') as f_src, open(dest, 'wb') as f_dst:
+                    while True:
+                        buf = f_src.read(4 * 1024 * 1024)
+                        if not buf:
+                            break
+                        f_dst.write(buf)
+                        copied += len(buf)
+                        if total_size > 0:
+                            cb_prog(min(copied / total_size, 1.0))
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def extract_contents(source, dest_folder, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire("Extração de Jogos APA")
+            try:
+                if source.startswith("\\\\.\\"):
+                    try:
+                        open(source, 'rb').close()
+                    except PermissionError:
+                        return cb_err("Permission Denied! Run as Administrator.")
+                cb_prog(0.05)
+                parts = APAManager.read_apa_partitions(source)
+                if not parts:
+                    return cb_err("No APA signature detected! Extraction aborted.")
+                cb_prog(0.1)
+                with open(source, 'rb') as f_src:
+                    game_parts = [p for p in parts if p['is_game']]
+                    if not game_parts:
+                        return cb_err("No HDL games detected on drive.")
+                    total_games = len(game_parts)
+                    for i, p in enumerate(game_parts):
+                        clean_title = p['id'].replace("PP.HDL.", "")
+                        out_path = os.path.join(dest_folder, f"{clean_title}.iso")
+                        data_offset = p['offset'] + (4 * 1024 * 1024)
+                        target_size = p.get('size_bytes', 4 * 1024 * 1024 * 1024) - (4 * 1024 * 1024)
+                        try:
+                            f_src.seek(data_offset)
+                            with open(out_path, 'wb') as f_out:
+                                read_bytes = 0
+                                while read_bytes < target_size:
+                                    buf = f_src.read(min(4 * 1024 * 1024, target_size - read_bytes))
+                                    if not buf:
+                                        break
+                                    f_out.write(buf)
+                                    read_bytes += len(buf)
+                                    prog = (i / total_games) + ((read_bytes / target_size) / total_games)
+                                    cb_prog(min(prog, 0.99))
+                        except IOError:
+                            pass
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class TranslationPatcher:
+    @staticmethod
+    def patch_iso(iso_in, iso_out, patch_file, remove_region, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire("Aplicação de Patch ISO")
+            try:
+                total_size = os.path.getsize(iso_in)
+                copied = 0
+                with open(iso_in, 'rb') as f_src, open(iso_out, 'wb') as f_dst:
+                    while True:
+                        buf = f_src.read(4 * 1024 * 1024)
+                        if not buf:
+                            break
+                        f_dst.write(buf)
+                        copied += len(buf)
+                        cb_prog((copied / total_size) * 0.8)
+
+                if patch_file.lower().endswith('.ips'):
+                    with open(patch_file, 'rb') as p, open(iso_out, 'r+b') as f:
+                        if p.read(5) != b'PATCH':
+                            raise Exception("Invalid IPS patch file header.")
+                        while True:
+                            offset_bytes = p.read(3)
+                            if offset_bytes == b'EOF' or len(offset_bytes) < 3:
+                                break
+                            offset = int.from_bytes(offset_bytes, 'big')
+                            size = int.from_bytes(p.read(2), 'big')
+                            if size == 0:
+                                rle_size = int.from_bytes(p.read(2), 'big')
+                                val = p.read(1)
+                                f.seek(offset)
+                                f.write(val * rle_size)
+                            else:
+                                data = p.read(size)
+                                f.seek(offset)
+                                f.write(data)
+                elif patch_file.lower().endswith(('.bps', '.xdelta')):
+                    return cb_err("BPS/XDelta format requires external tools.")
+
+                cb_prog(0.9)
+                if remove_region:
+                    with open(iso_out, 'r+b') as f:
+                        f.seek(0x80000)
+                        f.write(b'\x00\x00\x01\xBA' + b'\x00' * 16)
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class ArtScraperWorker:
+    @staticmethod
+    def format_opl_id(game_id):
+        clean = game_id.replace('-', '').replace('_', '').replace('.', '')
+        if len(clean) == 9:
+            return f"{clean[:4]}_{clean[4:7]}.{clean[7:]}"
+        return game_id
+
+    @staticmethod
+    def get_repo_id(game_id):
+        clean = game_id.replace('-', '').replace('_', '').replace('.', '')
+        if len(clean) == 9:
+            return f"{clean[:4]}-{clean[4:]}"
+        return game_id
+
+    @staticmethod
+    def scan_for_ids(mountpoint):
+        ids = set()
+        for folder in [os.path.join(mountpoint, "DVD"), os.path.join(mountpoint, "CD")]:
+            if os.path.exists(folder):
+                for f in os.listdir(folder):
+                    if f.lower().endswith(('.iso', '.zso')):
+                        game_id = GameAnalyzer.extract_game_id(os.path.join(folder, f))
+                        if game_id != "Unknown":
+                            ids.add(game_id)
+        ul_path = os.path.join(mountpoint, "ul.cfg")
+        if os.path.exists(ul_path):
+            try:
+                with open(ul_path, 'rb') as f:
+                    while True:
+                        entry = f.read(64)
+                        if not entry or len(entry) < 64:
+                            break
+                        game_id_raw = entry[32:47].decode('ascii', 'ignore').strip('\x00')
+                        if game_id_raw.startswith("ul."):
+                            ids.add(game_id_raw[3:])
+            except Exception:
+                pass
+        return list(ids)
+
+    @staticmethod
+    def download_single_art(mountpoint, game_id):
+        try:
+            art_folder = os.path.join(mountpoint, "ART")
+            os.makedirs(art_folder, exist_ok=True)
+            opl_id = ArtScraperWorker.format_opl_id(game_id)
+            target_file = os.path.join(art_folder, f"{opl_id}_COV.jpg")
+            if os.path.exists(target_file):
+                return True
+            url = f"https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/{ArtScraperWorker.get_repo_id(game_id)}.jpg"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as response, open(target_file, 'wb') as out_file:
+                out_file.write(response.read())
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def download_art(mountpoint, ids, cb_prog, cb_done, cb_err, cb_log):
+        def run():
+            try:
+                art_folder = os.path.join(mountpoint, "ART")
+                os.makedirs(art_folder, exist_ok=True)
+                total = len(ids)
+                if total == 0:
+                    cb_done(True)
+                    return
+                base_url = "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/{}.jpg"
+                for i, game_id in enumerate(ids):
+                    opl_id = ArtScraperWorker.format_opl_id(game_id)
+                    target_file = os.path.join(art_folder, f"{opl_id}_COV.jpg")
+                    if not os.path.exists(target_file):
+                        url = base_url.format(ArtScraperWorker.get_repo_id(game_id))
+                        cb_log(f"Fetching cover for {opl_id}...")
+                        try:
+                            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=5) as resp, open(target_file, 'wb') as out:
+                                out.write(resp.read())
+                            cb_log(f"-> SUCCESS: {opl_id}_COV.jpg")
+                        except Exception:
+                            cb_log(f"-> Cover not found on repository")
+                    else:
+                        cb_log(f"Skipped {opl_id} (already exists)")
+                    cb_prog((i + 1) / total)
+                    time.sleep(0.05)
+                cb_log("Cover download completed.")
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+class BinConverter:
+    @staticmethod
+    def convert(bin_path, iso_path, progress_cb, done_cb, err_cb, ps1_mode=False):
+        def run():
+            TransferLockManager.acquire("Conversão BIN para ISO")
+            try:
+                sector_size, data_offset, data_size = 2352, 24 if ps1_mode else 16, 2048
+                total_size = os.path.getsize(bin_path)
+                processed = 0
+                with open(bin_path, 'rb') as f_in, open(iso_path, 'wb') as f_out:
+                    while True:
+                        sector = f_in.read(sector_size)
+                        if not sector or len(sector) != sector_size:
+                            break
+                        f_out.write(sector[data_offset:data_offset + data_size])
+                        processed += len(sector)
+                        if processed % (sector_size * 2000) == 0:
+                            progress_cb(processed / total_size)
+                progress_cb(1.0)
+                done_cb(iso_path)
+            except Exception as e:
+                err_cb(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class USBUtilWorker:
+    @staticmethod
+    def split_and_generate(iso_path, dst_dir, game_name, cb_prog, cb_done, cb_err, cancel_flag_ref=None):
+        def run():
+            TransferLockManager.acquire("Divisão USBUtil (FAT32)")
+            try:
+                if not os.path.exists(iso_path) or not os.path.exists(dst_dir):
+                    raise Exception("Invalid source or destination paths.")
+                game_id = GameAnalyzer.extract_game_id(iso_path)
+                if game_id == "Unknown" or len(game_id) < 8:
+                    clean_id = "SLUS-20000"
+                else:
+                    clean_id = game_id.replace('-', '_')
+                safe_name = game_name.strip()[:32]
+                crc = zlib.crc32(safe_name.encode('utf-8')) & 0xFFFFFFFF
+                total_size = os.path.getsize(iso_path)
+                chunk_size = 1073741824 # 1 GB
+                num_parts = (total_size + chunk_size - 1) // chunk_size
+                media_type = 0x14 if total_size >= 700 * 1024 * 1024 else 0x12
+                with open(iso_path, 'rb') as f_in:
+                    for i in range(num_parts):
+                        if cancel_flag_ref and cancel_flag_ref():
+                            raise Exception("Operation cancelled by user.")
+                        part_path = os.path.join(dst_dir, f"ul.{crc:08X}.{clean_id}.{i:02d}")
+                        with open(part_path, 'wb') as f_out:
+                            bytes_to_write = min(chunk_size, total_size - (i * chunk_size))
+                            written = 0
+                            while written < bytes_to_write:
+                                if cancel_flag_ref and cancel_flag_ref():
+                                    raise Exception("Operation cancelled by user.")
+                                buf = f_in.read(1024 * 1024 * 4)
+                                if not buf:
+                                    break
+                                f_out.write(buf)
+                                written += len(buf)
+                                cb_prog((i * chunk_size + written) / total_size)
+                cfg_path = os.path.join(dst_dir, "ul.cfg")
+                entry = struct.pack('<32s 15s B B 23x', safe_name.encode('ascii', 'ignore'), f"ul.{clean_id}".encode('ascii', 'ignore'), num_parts, media_type)
+                with open(cfg_path, 'ab') as f_cfg:
+                    f_cfg.write(entry)
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class RealIsoTool:
+    @staticmethod
+    def extract(src, dst, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire("Extração de ISO")
+            try:
+                os.makedirs(dst, exist_ok=True)
+                abs_iso = os.path.abspath(src)
+                # Tenta 7-Zip primeiro se disponível (mais rápido e robusto)
+                sz_path = r"C:\Windows\System32\7z.exe" if os.path.exists(r"C:\Windows\System32\7z.exe") else (
+                    r"C:\Program Files\7-Zip\7z.exe" if os.path.exists(r"C:\Program Files\7-Zip\7z.exe") else None
+                )
+                if sz_path:
+                    res = subprocess.run(f'"{sz_path}" x "{abs_iso}" -o"{dst}" -y', shell=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    if res.returncode == 0:
+                        cb_prog(1.0)
+                        return cb_done(True)
+
+                # Fallback via PowerShell DiskImage
+                ps_mount = f'powershell -ExecutionPolicy Bypass -Command "$img = Mount-DiskImage -ImagePath \'{abs_iso}\' -PassThru; $vol = $img | Get-Volume; if ($vol) {{ echo $vol.DriveLetter }} else {{ echo \'\' }}"'
+                result = subprocess.run(ps_mount, shell=True, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                drive_letter = result.stdout.strip()
+                if not drive_letter:
+                    raise Exception("Failed to mount virtual disk and 7-Zip extraction returned error.")
+                source_dir = f"{drive_letter}:\\"
+                files_list = []
+                for r, d, files in os.walk(source_dir):
+                    for file in files:
+                        files_list.append(os.path.join(r, file))
+                total_size = sum(os.path.getsize(f) for f in files_list) or 1
+                copied = 0
+                for s_path in files_list:
+                    rel = os.path.relpath(s_path, source_dir)
+                    d_path = os.path.join(dst, rel)
+                    os.makedirs(os.path.dirname(d_path), exist_ok=True)
+                    with open(s_path, 'rb') as fsrc, open(d_path, 'wb') as fdst:
+                        while True:
+                            buf = fsrc.read(1024 * 1024 * 4)
+                            if not buf:
+                                break
+                            fdst.write(buf)
+                            copied += len(buf)
+                            cb_prog(copied / total_size)
+                try:
+                    subprocess.run(f'powershell -Command "Dismount-DiskImage -ImagePath \'{abs_iso}\'"', shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                except Exception:
+                    pass
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def repack(src_dir, dst_iso, cb_prog, cb_done, cb_err):
+        """Reempacota uma pasta extraída para ISO padrão compatível com PS2."""
+        def run():
+            TransferLockManager.acquire("Reempacotamento de Pasta para ISO")
+            try:
+                if not os.path.exists(src_dir):
+                    raise Exception("Source folder does not exist.")
+                if PYCDLIB_SUPPORT:
+                    iso = pycdlib.PyCdlib()
+                    iso.new(interchange_level=3)
+                    cb_prog(0.1)
+                    files_to_add = []
+                    for root, dirs, files in os.walk(src_dir):
+                        for f in files:
+                            full_path = os.path.join(root, f)
+                            rel_path = os.path.relpath(full_path, src_dir).replace('\\', '/').upper()
+                            files_to_add.append((full_path, "/" + rel_path))
+                    total = len(files_to_add) or 1
+                    for idx, (local_file, iso_entry) in enumerate(files_to_add):
+                        iso_parts = iso_entry.strip('/').split('/')
+                        current_dir = ""
+                        for part in iso_parts[:-1]:
+                            parent_dir = current_dir if current_dir else "/"
+                            current_dir = (current_dir + "/" + part) if current_dir else ("/" + part)
+                            try:
+                                iso.add_directory(iso_path=current_dir)
+                            except Exception:
+                                pass
+                        final_iso_name = iso_entry if ";" in iso_entry else (iso_entry + ";1")
+                        try:
+                            iso.add_file(local_file, iso_path=final_iso_name)
+                        except Exception:
+                            pass
+                        cb_prog(0.1 + (0.5 * ((idx + 1) / total)))
+                    cb_prog(0.7)
+                    iso.write(dst_iso)
+                    iso.close()
+                    cb_prog(1.0)
+                    cb_done(True)
+                else:
+                    raise Exception("pycdlib library is not installed.")
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def compress_zso(src, dst, level_str, cb_prog, cb_done, cb_err):
+        def run():
+            if not LZ4_SUPPORT:
+                return cb_err("LZ4 Python module is absent.")
+            TransferLockManager.acquire("Compressão ZSO")
+            try:
+                sector_size = 2048
+                iso_size = os.path.getsize(src)
+                total_blocks = (iso_size + sector_size - 1) // sector_size
+                fast_mode = "Fast" in level_str
+                with open(src, 'rb') as f_in, open(dst, 'wb') as f_out:
+                    f_out.write(b'\x00' * 24)
+                    f_out.write(b'\x00' * ((total_blocks + 1) * 4))
+                    indices, write_pos = [], 24 + ((total_blocks + 1) * 4)
+                    for i in range(total_blocks):
+                        block_data = f_in.read(sector_size)
+                        if not block_data:
+                            break
+                        pad = ((write_pos + 3) & ~3) - write_pos
+                        if pad > 0:
+                            f_out.write(b'\x00' * pad)
+                            write_pos += pad
+                        idx_val = write_pos >> 2
+                        compressed = lz4.block.compress(block_data, store_size=False, mode='fast' if fast_mode else 'high_compression')
+                        if len(compressed) >= len(block_data):
+                            idx_val |= 0x80000000
+                            f_out.write(block_data)
+                            write_pos += len(block_data)
+                        else:
+                            f_out.write(compressed)
+                            write_pos += len(compressed)
+                        indices.append(idx_val)
+                        if i % 1000 == 0:
+                            cb_prog(i / total_blocks)
+                    pad = ((write_pos + 3) & ~3) - write_pos
+                    if pad > 0:
+                        f_out.write(b'\x00' * pad)
+                        write_pos += pad
+                    indices.append(write_pos >> 2)
+                    f_out.seek(24)
+                    f_out.write(struct.pack(f'<{len(indices)}I', *indices))
+                    f_out.seek(0)
+                    f_out.write(struct.pack('<4s I Q I B B H', b'ZISO', 24, iso_size, sector_size, 1, 2, 0))
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class DriveManager:
+    @staticmethod
+    def get_drives():
+        drives = []
+        for p in psutil.disk_partitions(all=False):
+            if p.fstype.lower() in ['fat32', 'exfat', 'ntfs', 'fat', 'fat16']:
+                if p.device.startswith('C:'):
+                    continue
+                try:
+                    usage = psutil.disk_usage(p.mountpoint)
+                    drives.append({
+                        "device": p.device,
+                        "mountpoint": p.mountpoint,
+                        "fstype": p.fstype.upper(),
+                        "total": usage.total,
+                        "used": usage.used,
+                        "free": usage.free,
+                        "percent": usage.percent
+                    })
+                except Exception:
+                    continue
+        return drives
+
+    @staticmethod
+    def analyze_opl_structure(mountpoint):
+        folders = ['DVD', 'CD', 'ART', 'CFG', 'VMC', 'APPS']
+        struct_info = {d: os.path.isdir(os.path.join(mountpoint, d)) for d in folders}
+        return {
+            "folders": struct_info,
+            "status": "VALID" if all(struct_info.values()) else ("INCOMPLETE" if struct_info['DVD'] or struct_info['CD'] else "INVALID")
+        }
+
+    @staticmethod
+    def create_opl_structure(mountpoint):
+        """Cria automaticamente as pastas oficiais do OPL que estiverem faltando."""
+        folders = ['DVD', 'CD', 'ART', 'CFG', 'VMC', 'APPS', 'THM', 'POPS']
+        created = []
+        for f in folders:
+            target = os.path.join(mountpoint, f)
+            if not os.path.exists(target):
+                os.makedirs(target, exist_ok=True)
+                created.append(f)
+        return created
+
+class PhysicalDriveRipper:
+    @staticmethod
+    def get_optical_drives():
+        drives = []
+        try:
+            bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+            for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                if bitmask & 1 and ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\") == 5:
+                    drives.append(f"{letter}:\\")
+                bitmask >>= 1
+        except Exception:
+            pass
+        return drives
+
+    @staticmethod
+    def rip_drive(drive_letter, output_dir, force_iso, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire("Ripar Disco Óptico")
+            try:
+                drive_path = f"\\\\.\\{drive_letter[0]}:"
+                output_file = os.path.join(output_dir, f"PS2_DISC_{int(time.time())}.iso")
+                try:
+                    total_size = psutil.disk_usage(drive_letter).total
+                except Exception:
+                    total_size = 4 * 1024 * 1024 * 1024
+                copied = 0
+                with open(drive_path, 'rb') as f_in, open(output_file, 'wb') as f_out:
+                    while True:
+                        chunk = f_in.read(2048 * 1024)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                        copied += len(chunk)
+                        if total_size > 0:
+                            cb_prog(min(copied / total_size, 1.0))
+                cb_prog(1.0)
+                cb_done(output_file)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def analyze_disc(drive_letter):
+        info = {"game_id": "Unknown", "region": "Unknown", "size_str": "Unknown", "status": "No Disc / Unreadable"}
+        try:
+            info["size_str"] = format_size(psutil.disk_usage(drive_letter).total)
+            info["status"] = "Readable Disc"
+            cnf_path = os.path.join(drive_letter, "SYSTEM.CNF")
+            if os.path.exists(cnf_path):
+                with open(cnf_path, "r", encoding="utf-8", errors="ignore") as f:
+                    m = re.search(r'BOOT2\s*=\s*cdrom0:\\(.*?);', f.read(), re.IGNORECASE)
+                    if m:
+                        info["game_id"] = m.group(1).replace('_', '-').replace('.', '').upper()
+                        info["region"] = GameAnalyzer.REGION_MAP.get(info["game_id"][:4], "Unknown")
+                        info["status"] = "Valid PS2 Disc"
+        except Exception:
+            pass
+        return info
+
+class DvdBurnerWorker:
+    """Gravação real de DVD com suporte a isoburn.exe e IMAPI2."""
+    @staticmethod
+    def list_burners():
+        burners = []
+        if WIN32COM_SUPPORT:
+            try:
+                disc_master = win32com.client.Dispatch("IMAPI2.MsftDiscMaster2")
+                for i in range(disc_master.Count):
+                    rec_id = disc_master.Item(i)
+                    rec = win32com.client.Dispatch("IMAPI2.MsftDiscRecorder2")
+                    rec.InitializeDiscRecorder(rec_id)
+                    mps = rec.VolumeMountPoints
+                    mp_str = mps[0] if len(mps) > 0 else f"Drive_{i}"
+                    name = f"{rec.VendorId.strip()} {rec.ProductId.strip()}".strip()
+                    burners.append({"id": rec_id, "mount": mp_str, "name": f"{mp_str} ({name or 'DVD-RW'})"})
+            except Exception:
+                pass
+        if not burners:
+            for d in PhysicalDriveRipper.get_optical_drives():
+                burners.append({"id": d, "mount": d, "name": f"{d} (Gravador Óptico)"})
+        return burners
+
+    @staticmethod
+    def burn(iso_path, drive_id, speed_str, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire(t("tab_burn"))
+            try:
+                if not os.path.exists(iso_path):
+                    raise Exception(t("burn_err_select_iso"))
+                drive_letter = drive_id[0] if drive_id else ""
+                if not drive_letter or not os.path.exists(f"{drive_letter}:\\"):
+                    raise Exception(t("burn_err_nomedia"))
+
+                cb_prog(0.1)
+                cmd = ["isoburn.exe", f"{drive_letter}:", os.path.abspath(iso_path)]
+                proc = subprocess.Popen(cmd)
+                proc.wait()
+                if proc.returncode == 0:
+                    cb_prog(1.0)
+                    cb_done(True)
+                else:
+                    raise Exception(t("burn_err_title"))
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class SingleInstallWorker:
+    """Instalador 1-Clique real: detecta CD/DVD, FAT32 vs exFAT, divide se > 4GB e baixa capa."""
+    @staticmethod
+    def install(iso_path, target_drive, game_name, auto_cover, cb_prog, cb_done, cb_err):
+        def run():
+            TransferLockManager.acquire("Instalação de Jogo no Pendrive")
+            try:
+                if not os.path.exists(iso_path):
+                    raise Exception("ISO file not found.")
+                mp = target_drive.get('mountpoint', target_drive.get('device', ''))
+                if not os.path.exists(mp):
+                    raise Exception("Target drive not accessible.")
+
+                DriveManager.create_opl_structure(mp)
+                size = os.path.getsize(iso_path)
+                fs = target_drive.get('fstype', 'FAT32').upper()
+                game_id = GameAnalyzer.extract_game_id(iso_path)
+                safe_id = game_id.replace('-', '_') if game_id != "Unknown" else "SLUS_000.00"
+                clean_name = re.sub(r'[^a-zA-Z0-9_\-\. ]', '', game_name).strip()[:32]
+
+                cb_prog(0.05)
+                # FAT32 com mais de 4 GB: divide obrigatoriamente pelo USBUtil
+                if fs == "FAT32" and size > 4294967295:
+                    USBUtilWorker.split_and_generate(
+                        iso_path, mp, clean_name,
+                        cb_prog=lambda v: cb_prog(0.05 + 0.85 * v),
+                        cb_done=lambda s: None,
+                        cb_err=lambda e: None
+                    )
+                else:
+                    target_folder = os.path.join(mp, "CD" if size < (700 * 1024 * 1024) else "DVD")
+                    os.makedirs(target_folder, exist_ok=True)
+                    dest_file = os.path.join(target_folder, f"{safe_id}.{clean_name}.iso")
+                    copied = 0
+                    with open(iso_path, 'rb') as f_src, open(dest_file, 'wb') as f_dst:
+                        while True:
+                            buf = f_src.read(4 * 1024 * 1024)
+                            if not buf:
+                                break
+                            f_dst.write(buf)
+                            copied += len(buf)
+                            cb_prog(0.05 + (0.85 * (copied / size)))
+
+                if auto_cover and game_id != "Unknown":
+                    ArtScraperWorker.download_single_art(mp, game_id)
+
+                cb_prog(1.0)
+                cb_done(True)
+            except Exception as e:
+                cb_err(str(e))
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class BatchInstallWorker:
+    """Fila de processamento em lote sequencial real."""
+    def __init__(self, items, target_drive, auto_cover, cb_item_prog, cb_total_prog, cb_log, cb_done):
+        self.items = items
+        self.target_drive = target_drive
+        self.auto_cover = auto_cover
+        self.cb_item_prog = cb_item_prog
+        self.cb_total_prog = cb_total_prog
+        self.cb_log = cb_log
+        self.cb_done = cb_done
+        self.cancel_flag = False
+
+    def cancel(self):
+        self.cancel_flag = True
+
+    def start(self):
+        def run():
+            TransferLockManager.acquire("Fila de Instalação em Lote")
+            try:
+                total_items = len(self.items)
+                if total_items == 0:
+                    self.cb_done(True)
+                    return
+                for idx, item in enumerate(self.items):
+                    if self.cancel_flag:
+                        self.cb_log("Batch cancelled by user.")
+                        break
+                    iso_path = item.get('path', '')
+                    title = item.get('name', os.path.splitext(os.path.basename(iso_path))[0])
+                    self.cb_log(f"[{idx+1}/{total_items}] Installing: {title}...")
+                    
+                    done_event = threading.Event()
+                    item_error = []
+
+                    def on_done(s):
+                        done_event.set()
+
+                    def on_err(e):
+                        item_error.append(e)
+                        done_event.set()
+
+                    SingleInstallWorker.install(
+                        iso_path, self.target_drive, title, self.auto_cover,
+                        cb_prog=lambda v: [
+                            self.cb_item_prog(v),
+                            self.cb_total_prog((idx + v) / total_items)
+                        ],
+                        cb_done=on_done,
+                        cb_err=on_err
+                    )
+                    done_event.wait()
+                    if item_error:
+                        self.cb_log(f"-> ERROR on {title}: {item_error[0]}")
+                    else:
+                        self.cb_log(f"-> SUCCESS: {title} installed.")
+                    self.cb_total_prog((idx + 1) / total_items)
+
+                self.cb_total_prog(1.0)
+                self.cb_done(True)
+            except Exception as e:
+                self.cb_log(f"Fatal error in batch: {e}")
+                self.cb_done(False)
+            finally:
+                TransferLockManager.release()
+        threading.Thread(target=run, daemon=True).start()
+
+class PCSX2Integration:
+    @staticmethod
+    def test_iso(iso_path, err_cb):
+        def run():
+            try:
+                clean_iso_path = os.path.normpath(os.path.abspath(iso_path))
+                if not os.path.exists(clean_iso_path):
+                    return err_cb("Game ISO file not found.")
+                docs_path = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Documents", "PCSX2")
+                if not os.path.exists(os.path.join(docs_path, "bios")):
+                    shutil.copytree(get_res_path(os.path.join("pcsx2", "ETC", "PCSX2")), docs_path, dirs_exist_ok=True)
+                base_pcsx2 = get_res_path("pcsx2")
+                exe_path = next((os.path.join(base_pcsx2, e) for e in ["pcsx2-qt.exe", "pcsx2-qtx64.exe", "pcsx2.exe"] if os.path.exists(os.path.join(base_pcsx2, e))), None)
+                if not exe_path:
+                    return err_cb("PCSX2 executable not found in 'pcsx2' folder.")
+                subprocess.Popen([exe_path, clean_iso_path], cwd=base_pcsx2)
+            except Exception as e:
+                err_cb(str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+class MigrationWorker:
+    def __init__(self, drive, target_fs, callbacks, resume_data=None):
+        self.drive = drive
+        self.target_fs = target_fs
+        self.cb_log = callbacks['log']
+        self.cb_prog_total = callbacks['prog_total']
+        self.cb_prog_step = callbacks['prog_step']
+        self.cb_done = callbacks['done']
+        self.tmp_dir = os.path.join(APP_DATA_DIR, "jogos.tmp")
+        self.cancel_flag = False
+        self.resume_data = resume_data
+
+    def _copy_dir_with_progress(self, src_dir, dst_dir):
+        if not os.path.exists(dst_dir):
+            os.makedirs(dst_dir)
+        for r, d, f in os.walk(src_dir):
+            for file in f:
+                s_path = os.path.join(r, file)
+                d_path = os.path.join(dst_dir, os.path.relpath(os.path.join(r, file), src_dir))
+                os.makedirs(os.path.dirname(d_path), exist_ok=True)
+                offset = self.resume_data.get("copied", 0) if self.resume_data and self.resume_data.get("file") == s_path else 0
+                self.resume_data = None
+                size = os.path.getsize(s_path)
+                copied = offset
+                with open(s_path, 'rb') as fsrc, open(d_path, 'ab' if offset > 0 else 'wb') as fdst:
+                    fsrc.seek(offset)
+                    while True:
+                        if self.cancel_flag:
+                            raise Exception("Cancelled by user.")
+                        buf = fsrc.read(1024 * 1024 * 4)
+                        if not buf:
+                            break
+                        fdst.write(buf)
+                        copied += len(buf)
+                        self.cb_prog_step(copied / size if size > 0 else 1)
+                        TransferStateManager.save("migration", self.drive['mountpoint'], self.target_fs, s_path, copied, size)
+
+    def run(self):
+        TransferLockManager.acquire("Migração e Formatação de Unidade")
+        try:
+            self.cb_prog_total(0.0)
+            if not self.resume_data:
+                self.cb_log("Backing up drive data...")
+                self.cb_prog_total(0.1)
+                if os.path.exists(self.tmp_dir):
+                    shutil.rmtree(self.tmp_dir)
+                self._copy_dir_with_progress(self.drive['mountpoint'], self.tmp_dir)
+                self.cb_log("Formatting partition via DiskPart...")
+                self.cb_prog_total(0.4)
+                script_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), f"dp_{int(time.time())}.txt")
+                vol_letter = self.drive['device'].replace(':', '').replace('\\', '')
+                with open(script_path, "w") as f:
+                    f.write(f"select volume {vol_letter}\nformat fs={self.target_fs} label=PS2USB quick\n")
+                subprocess.run(f'diskpart /s "{script_path}"', shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                if os.path.exists(script_path):
+                    os.remove(script_path)
+            self.cb_log("Restoring files to target drive...")
+            self.cb_prog_total(0.5)
+            self._copy_dir_with_progress(self.tmp_dir, self.drive['mountpoint'])
+            self.cb_prog_total(0.9)
+            if os.path.exists(self.tmp_dir):
+                shutil.rmtree(self.tmp_dir)
+            TransferStateManager.clear()
+            self.cb_prog_total(1.0)
+            self.cb_prog_step(1.0)
+            self.cb_done(True)
+        except Exception as e:
+            self.cb_log(f"ERROR: {str(e)}")
+            self.cb_done(False)
+        finally:
+            TransferLockManager.release()
+
+class CloneWorker:
+    def __init__(self, src_drive, dst_drive, format_dst, format_src, callbacks, resume_data=None):
+        self.src = src_drive
+        self.dst = dst_drive
+        self.f_dst = format_dst
+        self.f_src = format_src
+        self.cb_log = callbacks['log']
+        self.cb_prog_total = callbacks['prog_total']
+        self.cancel_flag = False
+        self.resume_data = resume_data
+
+    def _diskpart_format(self, drive, fs, label):
+        script_path = os.path.join(os.environ.get("TEMP", "C:\\Temp"), f"dp_clone_{int(time.time())}.txt")
+        vol_letter = drive.replace(':', '').replace('\\', '')
+        with open(script_path, "w") as f:
+            f.write(f"select volume {vol_letter}\nformat fs={fs} label={label} quick\n")
+        subprocess.run(f'diskpart /s "{script_path}"', shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        if os.path.exists(script_path):
+            os.remove(script_path)
+
+    def run(self):
+        TransferLockManager.acquire("Clonagem de Pendrive")
+        try:
+            self.cb_prog_total(0.0)
+            if self.f_dst and not self.resume_data:
+                self._diskpart_format(self.dst['device'], "FAT32", "PS2USB")
+            for r, dirs, files in os.walk(self.src['mountpoint']):
+                for d in dirs:
+                    os.makedirs(os.path.join(self.dst['mountpoint'], os.path.relpath(os.path.join(r, d), self.src['mountpoint'])), exist_ok=True)
+                for f in files:
+                    s_file = os.path.join(r, f)
+                    d_file = os.path.join(self.dst['mountpoint'], os.path.relpath(os.path.join(r, f), self.src['mountpoint']))
+                    offset = self.resume_data.get("copied", 0) if self.resume_data and self.resume_data.get("file") == s_file else 0
+                    self.resume_data = None
+                    size = os.path.getsize(s_file)
+                    copied = offset
+                    with open(s_file, 'rb') as fsrc, open(d_file, 'ab' if offset > 0 else 'wb') as fdst:
+                        fsrc.seek(offset)
+                        while True:
+                            if self.cancel_flag:
+                                raise Exception("Cancelled by user.")
+                            buf = fsrc.read(1024 * 1024 * 4)
+                            if not buf:
+                                break
+                            fdst.write(buf)
+                            copied += len(buf)
+                            TransferStateManager.save("clone", self.src['mountpoint'], self.dst['mountpoint'], s_file, copied, size, {"fmt_after": self.f_src})
+            if self.f_src:
+                self._diskpart_format(self.src['device'], "FAT32", "EMPTY_USB")
+            TransferStateManager.clear()
+            self.cb_prog_total(1.0)
+        except Exception as e:
+            self.cb_log(f"ERROR: {str(e)}")
+        finally:
+            TransferLockManager.release()
+
+class OplAppsManager:
+    @staticmethod
+    def install_app(app_name, elf_path, usb_mountpoint):
+        try:
+            apps_dir = os.path.join(usb_mountpoint, "APPS")
+            safe_name = "".join(c for c in app_name if c.isalnum() or c in (' ', '_')).rstrip()
+            target_dir = os.path.join(apps_dir, safe_name)
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(elf_path, os.path.join(target_dir, "boot.elf"))
+            with open(os.path.join(target_dir, "title.cfg"), "w", encoding="utf-8") as f:
+                f.write(f"title={app_name}\nboot=boot.elf\n")
+            return True
+        except Exception as e:
+            return str(e)
+
+
+# Compatibilidade e apelidos de classes
+UsbDetector = DriveManager
+DriveManager.get_removable_drives = staticmethod(DriveManager.get_drives)
+AppManager = OplAppsManager
+OplAppsManager.install_elf = staticmethod(lambda mp, title, elf: OplAppsManager.install_app(title, elf, mp))
