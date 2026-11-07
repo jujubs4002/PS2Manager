@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 import time
@@ -502,21 +504,23 @@ def apply_window_icon(w, base_dir):
             w.iconbitmap(icon_path)
         except Exception:
             pass
-        try:
-            hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
-            if not hwnd:
-                hwnd = w.winfo_id()
-            LR_LOADFROMFILE = 0x00000010
-            IMAGE_ICON = 1
-            WM_SETICON = 0x0080
-            h_icon_sm = ctypes.windll.user32.LoadImageW(None, icon_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
-            if h_icon_sm and hwnd:
-                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 0, h_icon_sm)
-            h_icon_lg = ctypes.windll.user32.LoadImageW(None, icon_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
-            if h_icon_lg and hwnd:
-                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 1, h_icon_lg)
-        except Exception:
-            pass
+        if sys.platform == "win32":
+            try:
+                u32 = ctypes.windll.user32
+                u32.GetParent.restype = ctypes.c_void_p
+                u32.LoadImageW.restype = ctypes.c_void_p
+                hwnd = u32.GetParent(w.winfo_id()) or w.winfo_id()
+                LR_LOADFROMFILE = 0x00000010
+                IMAGE_ICON = 1
+                WM_SETICON = 0x0080
+                h_icon_sm = u32.LoadImageW(None, icon_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+                if h_icon_sm and hwnd:
+                    u32.SendMessageW(hwnd, WM_SETICON, 0, h_icon_sm)
+                h_icon_lg = u32.LoadImageW(None, icon_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+                if h_icon_lg and hwnd:
+                    u32.SendMessageW(hwnd, WM_SETICON, 1, h_icon_lg)
+            except Exception:
+                pass
 
 
 def create_shortcut(target_path, shortcut_path, icon_path=None):
@@ -583,6 +587,7 @@ def register_uninstall(install_dir, version, display_icon):
             'taskkill /F /IM PS2Manager.exe >nul 2>&1\n'
             'timeout /t 1 /nobreak >nul\n'
             'reg delete "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PS2Manager" /f >nul 2>&1\n'
+            'reg delete "HKLM\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PS2Manager" /f >nul 2>&1\n'
             'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PS2Manager" /f >nul 2>&1\n'
             'del /f /q "%PUBLIC%\\Desktop\\PS2Manager.lnk" >nul 2>&1\n'
             'del /f /q "%USERPROFILE%\\Desktop\\PS2Manager.lnk" >nul 2>&1\n'

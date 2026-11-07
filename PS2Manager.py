@@ -1,830 +1,129 @@
+from __future__ import annotations
+
 import os
 import sys
-import time
-import threading
-import subprocess
+
+# Interceptador CLI ANTES da interface gráfica: garante que Watchdog e scripts
+# internos rodem 100% pelo Python EMBUTIDO dentro do PS2Manager (sem exigir Python no PC do usuário).
+if len(sys.argv) >= 2 and sys.argv[1] in ("--watchdog", "--run-script"):
+    from scripts.core_backend import run_watchdog_loop, run_internal_script
+    if sys.argv[1] == "--watchdog" and len(sys.argv) >= 5:
+        run_watchdog_loop(int(sys.argv[2]), sys.argv[3], sys.argv[4])
+        sys.exit(0)
+    elif sys.argv[1] == "--run-script" and len(sys.argv) >= 3:
+        run_internal_script(sys.argv[2])
+        sys.exit(0)
+
 import shutil
+import threading
 import webbrowser
 import ctypes
+import tkinter as tk
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
-
-# Importa os módulos divididos: backend essencial e motores de ferramentas
-from scripts.core_backend import *
-from scripts.tool_workers import *
+from tkinter import filedialog, messagebox, colorchooser
 
 try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ps2manager.suite.v107")
+    from PIL import Image as _BgPILImage, ImageFilter as _BgPILFilter, ImageEnhance as _BgPILEnhance, ImageTk as _BgPILTk
+    _BG_PIL_OK = True
+    _BG_RESAMPLE_BILINEAR = getattr(getattr(_BgPILImage, "Resampling", None), "BILINEAR", getattr(_BgPILImage, "BILINEAR", 2))
+except Exception:
+    _BG_PIL_OK = False
+    _BG_RESAMPLE_BILINEAR = 2
+
+from scripts.core_backend import *
+from scripts.tool_workers import *
+from scripts.v108_workers import *
+from scripts.ui_pages import (
+    apply_window_icon, NotificationPopup, HoverCard, PageHeader,
+    create_segmented_tabs, UsbOptimizerPage, OplConfigPage,
+    ArtScraperV2Page, MemoryCardPage, PopStarterPage,
+    IsoPatcherV2Page, IsoStudioPage
+)
+from scripts.ui_modals import (
+    SetupFrame, RemoteNoticeClient, NewsOverlayModal,
+    VersionRollbackModal, ChangelogTimelineModal,
+    GameDetailsModal, CheatManagerPage, EmulatorTestPage,
+    DvdBurnerPage, AppsManagerPage
+)
+
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ps2manager.suite.v108")
 except Exception:
     pass
 
-def apply_window_icon(w):
-    icon_path = get_res_path("icon.ico")
-    if os.path.exists(icon_path):
-        try:
-            w.iconbitmap(icon_path)
-        except Exception:
-            pass
-        try:
-            hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
-            if not hwnd:
-                hwnd = w.winfo_id()
-            LR_LOADFROMFILE = 0x00000010
-            IMAGE_ICON = 1
-            WM_SETICON = 0x0080
-            h_icon_sm = ctypes.windll.user32.LoadImageW(None, icon_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
-            if h_icon_sm and hwnd:
-                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 0, h_icon_sm)
-            h_icon_lg = ctypes.windll.user32.LoadImageW(None, icon_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
-            if h_icon_lg and hwnd:
-                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 1, h_icon_lg)
-        except Exception:
-            pass
 
-class SetupFrame(ctk.CTkFrame):
-    def __init__(self, master, app):
-        super().__init__(master, fg_color=cfg.get_color("bg_main"))
-        self.app = app
-        self.pack(fill="both", expand=True)
-        self.content = ctk.CTkFrame(self, fg_color="transparent")
-        self.content.place(relx=0.5, rely=0.5, anchor="center")
-        apply_window_icon(self.master)
-        self.after(80, lambda: apply_window_icon(self.master))
-        self.show_step_0()
-
-    def clear(self):
-        for w in self.content.winfo_children():
-            w.destroy()
-
-    def show_step_0(self):
-        self.clear()
-        ctk.CTkLabel(
-            self.content, text="PS2 MANAGER",
-            font=("Segoe UI Black", 34), text_color=cfg.get_color("accent")
-        ).pack(pady=(20, 5))
-        ctk.CTkLabel(
-            self.content, text=t("setup_welcome"),
-            font=("Segoe UI", 16), text_color=cfg.get_color("text_main")
-        ).pack(pady=(0, 35))
-        ctk.CTkButton(
-            self.content, text=t("setup_continue"),
-            font=("Segoe UI", 13, "bold"), height=42, width=220,
-            corner_radius=cfg.get_radius("button"), command=self.show_step_1
-        ).pack()
-
-    def show_step_1(self):
-        self.clear()
-        ctk.CTkLabel(
-            self.content, text=t("setup_lang"),
-            font=("Segoe UI", 18, "bold"), text_color=cfg.get_color("text_main")
-        ).pack(pady=(15, 25))
-
-        def set_lang(l):
-            cfg.data["language"] = l
-            cfg.save()
-            self.show_step_2()
-
-        r = cfg.get_radius("button")
-        langs = [
-            ("Português (Brasil)", "PT_BR"),
-            ("Português (Portugal)", "PT"),
-            ("English", "EN"),
-            ("Español", "ES"),
-            ("Русский", "RU"),
-            ("日本語", "JA")
-        ]
-        for label, code in langs:
-            ctk.CTkButton(
-                self.content, text=label, height=38, width=280,
-                corner_radius=r, fg_color=cfg.get_color("card_base"),
-                text_color=cfg.get_color("text_main"), hover_color=cfg.get_color("card_hover"),
-                command=lambda c=code: set_lang(c)
-            ).pack(pady=4)
-
-    def show_step_2(self):
-        self.clear()
-        ctk.CTkLabel(
-            self.content, text=t("setup_model"),
-            font=("Segoe UI", 18, "bold"), text_color=cfg.get_color("text_main")
-        ).pack(pady=(20, 15))
-        models = ["SCPH-10000", "SCPH-3000x", "SCPH-5000x", "SCPH-7000x", "SCPH-9000x", "PSX DESR"]
-        self.cmb_model = ctk.CTkComboBox(
-            self.content, values=models, font=("Segoe UI", 13),
-            height=38, width=260, corner_radius=cfg.get_radius("entry")
-        )
-        self.cmb_model.pack(pady=10)
-        ctk.CTkLabel(
-            self.content, text=t("setup_type"),
-            font=("Segoe UI", 18, "bold"), text_color=cfg.get_color("text_main")
-        ).pack(pady=(20, 15))
-        self.cmb_type = ctk.CTkComboBox(
-            self.content, values=["SLIM", "FAT"], font=("Segoe UI", 13),
-            height=38, width=260, corner_radius=cfg.get_radius("entry")
-        )
-        self.cmb_type.pack(pady=10)
-        ctk.CTkButton(
-            self.content, text=t("setup_continue"),
-            font=("Segoe UI", 13, "bold"), height=42, width=220,
-            corner_radius=cfg.get_radius("button"), command=self.show_step_3
-        ).pack(pady=25)
-
-    def show_step_3(self):
-        self.clear()
-        ctk.CTkLabel(
-            self.content, text=t("setup_finish"),
-            font=("Segoe UI", 18, "bold"), text_color=cfg.get_color("accent")
-        ).pack(pady=(20, 10))
-        cfg.data["ps2_model"] = self.cmb_model.get()
-        cfg.data["ps2_type"] = self.cmb_type.get()
-        cfg.data["setup_done"] = True
-        cfg.save()
-        ctk.CTkButton(
-            self.content, text="START PS2 MANAGER",
-            font=("Segoe UI", 14, "bold"), height=45, width=240,
-            fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"),
-            command=self.finish
-        ).pack(pady=30)
-
-    def finish(self):
-        self.destroy()
-        self.app.build_main_ui()
-
-class VersionRollbackModal(ctk.CTkToplevel):
-    def __init__(self, master):
-        super().__init__(master)
-        self.title(t("modal_rollback"))
-        self.geometry("450x520")
-        self.configure(fg_color=cfg.get_color("bg_main"))
-        self.attributes("-topmost", True)
-        apply_window_icon(self)
-        self.after(80, lambda: apply_window_icon(self))
-
-        ctk.CTkLabel(
-            self, text=t("ver_btn"), font=("Segoe UI", 16, "bold"),
-            text_color=cfg.get_color("accent")
-        ).pack(pady=(20, 5))
-        self.sf = ctk.CTkScrollableFrame(
-            self, fg_color=cfg.get_color("card_base"),
-            corner_radius=cfg.get_radius("card"), border_width=1,
-            border_color=cfg.get_color("border")
-        )
-        self.sf.pack(fill="both", expand=True, padx=20, pady=20)
-        ver_dir = os.path.join(BASE_DIR, "VER")
-        os.makedirs(ver_dir, exist_ok=True)
-        exes = [f for f in os.listdir(ver_dir) if f.lower().endswith('.exe')]
-        if not exes:
-            ctk.CTkLabel(self.sf, text=t("ver_empty"), text_color=cfg.get_color("text_muted")).pack(pady=30)
-        else:
-            for exe in exes:
-                ctk.CTkButton(
-                    self.sf, text=f"{t('ver_launch')} {os.path.splitext(exe)[0]}",
-                    fg_color=cfg.get_color("bg_main"), text_color=cfg.get_color("text_main"),
-                    hover_color=cfg.get_color("accent"), height=36,
-                    corner_radius=cfg.get_radius("button"),
-                    command=lambda e=exe: self.launch_old(e)
-                ).pack(fill="x", pady=4, padx=5)
-
-    def launch_old(self, exe_name):
-        subprocess.Popen([os.path.join(BASE_DIR, "VER", exe_name)])
-        sys.exit(0)
-
-class ChangelogTimelineModal(ctk.CTkToplevel):
-    """Linha do tempo interativa e arrastável com histórico e roadmap de atualizações 100% localizado."""
-    RELEASES = [
-        {
-            "ver": "v1.00", "date": "06/09/2026",
-            "title": ["Initial Release", "Lançamento Inicial", "Lançamento Inicial", "Lanzamiento Inicial", "Первый релиз", "初期リリース"],
-            "desc": [
-                "First public release of PS2Manager with library explorer and game detection.",
-                "Primeira versão pública do PS2Manager com explorador básico e leitura de jogos.",
-                "Primeira versão pública do PS2Manager com explorador básico e leitura de jogos.",
-                "Primera versión pública de PS2Manager con explorador básico y detección de juegos.",
-                "Первый публичный релиз PS2Manager с проводником игр и автоопределением.",
-                "ライブラリ閲覧とゲーム検出を備えたPS2Managerの初期公開バージョン。"
-            ]
-        },
-        {
-            "ver": "v1.01", "date": "07/09/2026",
-            "title": ["Audio & Themes Support", "Áudio & Suporte a Temas", "Áudio & Suporte a Temas", "Audio y Soporte de Temas", "Звуки и поддержка тем", "オーディオ＆テーマ対応"],
-            "desc": [
-                "Integrated sound feedback with Pygame and UI color palette themes.",
-                "Integração do sistema de som com Pygame e temas de cores da interface.",
-                "Integração do sistema de som com Pygame e temas de cores da interface.",
-                "Integración de sonido con Pygame y personalización de temas visuales.",
-                "Интеграция звуков через Pygame и поддержка тем оформления.",
-                "Pygameによるサウンド再生とUIカラーテーマのサポート。"
-            ]
-        },
-        {
-            "ver": "v1.02", "date": "08/09/2026",
-            "title": ["OPL Apps & Memory Card", "OPL Apps & Cartões de Memória", "OPL Apps & Cartões de Memória", "OPL Apps y Memory Card", "OPL приложения и карты памяти", "OPLアプリ＆メモリーカード"],
-            "desc": [
-                "Support for installing homebrew ELF applications and VMC management.",
-                "Suporte à instalação de aplicativos homebrew ELF e gerenciamento de VMC.",
-                "Suporte à instalação de aplicações homebrew ELF e gestão de VMC.",
-                "Instalación de aplicaciones ELF y gestión de tarjetas de memoria virtuales.",
-                "Поддержка установки приложений ELF и управление картами памяти VMC.",
-                "ELFアプリのインストールと仮想メモリーカード（VMC）管理の追加。"
-            ]
-        },
-        {
-            "ver": "v1.03", "date": "29/09/2026",
-            "title": ["Cheat Engine", "Criador de Cheats", "Criador de Cheats", "Gestor de Cheats", "Редактор читов", "チートエディタ"],
-            "desc": [
-                "Raw .cht cheat file editor and manager for PS2RD and OPL.",
-                "Adicionado gerenciador e editor de arquivos .cht (RAW) para uso no PS2RD/OPL.",
-                "Adicionado gestor e editor de ficheiros .cht (RAW) para uso no PS2RD/OPL.",
-                "Gestión y edición de trucos .cht (RAW) para PS2RD y OPL.",
-                "Редактор и менеджер файлов читов .cht (RAW) для PS2RD и OPL.",
-                "PS2RDおよびOPL用の.cht（RAW）チートファイルの作成・編集機能。"
-            ]
-        },
-        {
-            "ver": "v1.04", "date": "01/10/2026",
-            "title": ["USBUtil Support", "Suporte a USBUtil", "Suporte a USBUtil", "Soporte USBUtil", "Поддержка USBUtil", "USBUtilサポート"],
-            "desc": [
-                "Automatic splitting of games over 4GB for FAT32 drives with ul.cfg creation.",
-                "Divisão automática de jogos maiores que 4 GB para pendrives FAT32 com geração de ul.cfg.",
-                "Divisão automática de jogos maiores que 4 GB para unidades FAT32 com geração de ul.cfg.",
-                "División automática de juegos mayores de 4 GB para FAT32 con ul.cfg.",
-                "Автоматическое разделение игр более 4 ГБ для FAT32 с созданием ul.cfg.",
-                "FAT32ドライブ用に4GB超のゲームを自動分割しul.cfgを生成。"
-            ]
-        },
-        {
-            "ver": "v1.05", "date": "02/10/2026",
-            "title": ["Stability & Fixes", "Estabilidade & Correções", "Estabilidade & Correções", "Estabilidad y Correcciones", "Стабильность и исправления", "安定性の向上と修正"],
-            "desc": [
-                "Fixed USB detection on Windows 11, improved game scraper speed and UI responsiveness.",
-                "Correção na detecção de pendrives no Windows 11, otimização do scraper e interface.",
-                "Correção na deteção de unidades no Windows 11, otimização do scraper e interface.",
-                "Corrección en detección USB para Win11 y mejoras de rendimiento general.",
-                "Исправлено обнаружение USB в Windows 11, ускорен поиск обложек.",
-                "Windows 11でのUSB検出修正、ジャケット取得高速化、応答性改善。"
-            ]
-        },
-        {
-            "ver": "v1.06", "date": "10/10/2026",
-            "title": ["Disc Analyzer & Installer", "Analisador de Discos", "Analisador de Discos", "Analizador de Discos", "Анализатор оптических дисков", "ディスクアナライザー"],
-            "desc": [
-                "Direct optical disc analysis, binary header inspection, and custom installer.",
-                "Análise direta de CDs/DVDs físicos, leitura de cabeçalhos binários e instalador customizado.",
-                "Análise direta de CDs/DVDs físicos, leitura de cabeçalhos binários e instalador personalizado.",
-                "Análisis directo de discos físicos, lectura de encabezados e instalador.",
-                "Прямой анализ оптических дисков, чтение бинарных заголовков и инсталлятор.",
-                "光学ディスクの直接解析、バイナリヘッダー検査、カスタムインストーラーの追加。"
-            ]
-        },
-        {
-            "ver": "v1.07", "date": "06/11/2026",
-            "title": ["Ultimate PS2 Suite (Current)", "Versão Atual (V1.07)", "Versão Atual (V1.07)", "Versión Actual (V1.07)", "Текущая версия (V1.07)", "現在のバージョン (V1.07)"],
-            "desc": [
-                "1-Click USB install, batch queue, real DVD burner, modern dark UI, anti-corruption watchdog, laptop mode, 6 languages (PT-BR, PT, EN, ES, RU, JA).",
-                "Instalação 1-clique no pendrive, fila de processamento em lote, gravação real de DVD, nova interface moderna, watchdog anti-corrupção, modo notebook, 6 idiomas completos.",
-                "Instalação 1-clique no pendrive, fila de processamento por lotes, gravação real de DVD, nova interface moderna, watchdog anti-corrupção, modo portátil, 6 idiomas completos.",
-                "Instalación 1-clic en USB, cola por lotes, grabador de DVD real, interfaz moderna, protector anti-corrupción, modo portátil, 6 idiomas.",
-                "Установка в 1 клик на USB, пакетная очередь, реальная запись DVD, новый интерфейс, защита от повреждения файлов, режим ноутбука, 6 языков.",
-                "1クリックUSBインストール、一括キュー、実DVD書き込み、最新UI、ファイル破損防止監視、ノートPCモード、6言語対応。"
-            ]
-        },
-        {
-            "ver": "v1.08+", "date": "Future",
-            "title": ["Future Update", "Próxima Atualização", "Próxima Atualização", "Futura Actualización", "Будущее обновление", "将来のアップデート"],
-            "desc": [
-                "No future updates currently planned. Enjoy all features of v1.07!",
-                "Nenhuma atualização planejada no momento. Aproveite todos os recursos da v1.07!",
-                "Nenhuma atualização planeada no momento. Aproveite todos os recursos da v1.07!",
-                "No hay actualizaciones planificadas actualmente. ¡Disfruta la v1.07!",
-                "На данный момент обновлений не планируется. Наслаждайтесь всеми функциями v1.07!",
-                "現在計画されている更新はありません。v1.07の全機能をお楽しみください！"
-            ]
-        }
-    ]
-
-    def __init__(self, master):
-        super().__init__(master)
-        self.title(t("roadmap_title"))
-        self.geometry("700x560")
-        self.configure(fg_color=cfg.get_color("bg_main"))
-        self.resizable(False, False)
-        self.attributes("-topmost", True)
-        apply_window_icon(self)
-        self.after(80, lambda: apply_window_icon(self))
-
-        self.cur_idx = 7  # Índice da v1.07 (atual)
-        lang_code = cfg.data.get("language", "PT_BR")
-        self.lang_idx = LANGS.get(lang_code, 1)
-
-        ctk.CTkLabel(
-            self, text=t("roadmap_title"),
-            font=("Segoe UI Black", 18), text_color=cfg.get_color("accent")
-        ).pack(pady=(20, 5))
-        ctk.CTkLabel(
-            self, text=t("roadmap_sub"),
-            font=("Segoe UI", 12), text_color=cfg.get_color("text_muted")
-        ).pack(pady=(0, 15))
-
-        timeline_frm = ctk.CTkFrame(
-            self, fg_color=cfg.get_color("card_base"),
-            corner_radius=12, border_width=1, border_color=cfg.get_color("border")
-        )
-        timeline_frm.pack(fill="x", padx=30, pady=10)
-
-        nodes_frm = ctk.CTkFrame(timeline_frm, fg_color="transparent")
-        nodes_frm.pack(fill="x", padx=20, pady=(15, 10))
-        nodes_frm.grid_columnconfigure(tuple(range(len(self.RELEASES))), weight=1)
-
-        self.node_lbls = []
-        for idx, r_data in enumerate(self.RELEASES):
-            lbl = ctk.CTkLabel(
-                nodes_frm, text=r_data["ver"],
-                font=("Segoe UI", 10, "bold"),
-                text_color=cfg.get_color("highlight") if idx == self.cur_idx else cfg.get_color("text_muted")
-            )
-            lbl.grid(row=0, column=idx, padx=4)
-            self.node_lbls.append(lbl)
-
-        self.slider = ctk.CTkSlider(
-            timeline_frm, from_=0, to=len(self.RELEASES) - 1, number_of_steps=len(self.RELEASES) - 1,
-            command=self.on_slide, height=18, progress_color=cfg.get_color("accent")
-        )
-        self.slider.pack(fill="x", padx=30, pady=(0, 10))
-        self.slider.set(self.cur_idx)
-
-        self.card = ctk.CTkFrame(
-            self, fg_color=cfg.get_color("card_base"),
-            corner_radius=14, border_width=1, border_color=cfg.get_color("border")
-        )
-        self.card.pack(fill="both", expand=True, padx=30, pady=15)
-
-        self.lbl_ver = ctk.CTkLabel(self.card, text="", font=("Segoe UI Black", 24), text_color=cfg.get_color("accent"))
-        self.lbl_ver.pack(pady=(20, 2))
-
-        self.lbl_date = ctk.CTkLabel(self.card, text="", font=("Consolas", 12, "bold"), text_color=cfg.get_color("text_muted"))
-        self.lbl_date.pack(pady=(0, 15))
-
-        self.lbl_title = ctk.CTkLabel(self.card, text="", font=("Segoe UI", 16, "bold"), text_color=cfg.get_color("text_main"))
-        self.lbl_title.pack(pady=(0, 10))
-
-        self.lbl_desc = ctk.CTkLabel(
-            self.card, text="", font=("Segoe UI", 13),
-            text_color=cfg.get_color("text_main"), wraplength=550, justify="center"
-        )
-        self.lbl_desc.pack(pady=(0, 20), padx=30)
-
-        nav_frm = ctk.CTkFrame(self, fg_color="transparent")
-        nav_frm.pack(fill="x", padx=30, pady=(0, 20))
-        ctk.CTkButton(
-            nav_frm, text=t("roadmap_prev"), width=140,
-            fg_color=cfg.get_color("card_base"), hover_color=cfg.get_color("card_hover"),
-            command=lambda: self.step(-1)
-        ).pack(side="left")
-        ctk.CTkButton(
-            nav_frm, text=t("roadmap_next"), width=140,
-            fg_color=cfg.get_color("card_base"), hover_color=cfg.get_color("card_hover"),
-            command=lambda: self.step(1)
-        ).pack(side="right")
-
-        self.update_view()
-
-    def on_slide(self, val):
-        self.cur_idx = int(round(val))
-        self.update_view()
-
-    def step(self, delta):
-        self.cur_idx = max(0, min(len(self.RELEASES) - 1, self.cur_idx + delta))
-        self.slider.set(self.cur_idx)
-        self.update_view()
-
-    def update_view(self):
-        item = self.RELEASES[self.cur_idx]
-        is_cur = (self.cur_idx == 7)
-        self.lbl_ver.configure(
-            text=f"{item['ver']} - {t('roadmap_cur')}" if is_cur else item['ver'],
-            text_color=cfg.get_color("highlight") if is_cur else cfg.get_color("accent")
-        )
-        self.lbl_date.configure(text=f"Release Date: {item['date']}")
-        t_list = item["title"]
-        title_text = t_list[self.lang_idx] if self.lang_idx < len(t_list) else (t_list[0] if isinstance(t_list, list) else str(t_list))
-        d_list = item["desc"]
-        desc_text = d_list[self.lang_idx] if self.lang_idx < len(d_list) else (d_list[0] if isinstance(d_list, list) else str(d_list))
-        self.lbl_title.configure(text=title_text)
-        self.lbl_desc.configure(text=desc_text)
-        for idx, lbl in enumerate(self.node_lbls):
-            if idx == self.cur_idx:
-                lbl.configure(text_color=cfg.get_color("highlight"), font=("Segoe UI", 11, "bold"))
-            else:
-                lbl.configure(text_color=cfg.get_color("text_muted"), font=("Segoe UI", 10))
-
-class NotificationPopup(ctk.CTkFrame):
-    def __init__(self, master, message, kind="info"):
-        color = cfg.get_color("accent")
-        if kind == "success": color = cfg.get_color("success")
-        elif kind == "error": color = cfg.get_color("danger")
-        elif kind == "warning": color = cfg.get_color("warning")
-        super().__init__(master, fg_color=color, corner_radius=cfg.get_radius("chip"))
-        ctk.CTkLabel(self, text=message, font=("Segoe UI", 12, "bold"), text_color="#FFFFFF").pack(padx=20, pady=10)
-        self.place(relx=0.5, rely=0.05, anchor="n")
-        self.after(3000, self.dismiss)
-
-    def dismiss(self):
-        try:
-            self.destroy()
-        except Exception:
-            pass
-
-class HoverCard(ctk.CTkFrame):
-    def __init__(self, master, **kwargs):
-        self.default_fg = kwargs.get("fg_color", cfg.get_color("card_base"))
-        self.hover_fg = kwargs.pop("hover_color", cfg.get_color("card_hover"))
-        self.on_click_cb = kwargs.pop("command", None)
-        super().__init__(master, **kwargs)
-        if not cfg.data.get("laptop_mode", False):
-            self.bind("<Enter>", self._on_enter)
-            self.bind("<Leave>", self._on_leave)
-        if self.on_click_cb:
-            self.bind("<Button-1>", self._on_click)
-
-    def _on_enter(self, e):
-        if cfg.data.get("animations", True) and not cfg.data.get("laptop_mode", False):
-            self.configure(fg_color=self.hover_fg)
-
-    def _on_leave(self, e):
-        self.configure(fg_color=self.default_fg)
-
-    def _on_click(self, e):
-        if self.on_click_cb:
-            self.on_click_cb()
-
-    def bind_children(self, widget):
-        if not cfg.data.get("laptop_mode", False):
-            widget.bind("<Enter>", self._on_enter)
-            widget.bind("<Leave>", self._on_leave)
-        if self.on_click_cb:
-            widget.bind("<Button-1>", self._on_click)
-        for child in widget.winfo_children():
-            self.bind_children(child)
-
-class GameDetailsModal(ctk.CTkToplevel):
-    def __init__(self, master, game_data):
-        super().__init__(master)
-        self.title(t("modal_game_profile"))
-        self.geometry("480x480")
-        self.configure(fg_color=cfg.get_color("bg_main"))
-        self.resizable(False, False)
-        self.attributes("-topmost", True)
-        apply_window_icon(self)
-        self.after(80, lambda: apply_window_icon(self))
-
-        self.app, self.game_data = master, game_data
-        ctk.CTkLabel(
-            self, text=game_data.get('name', 'Unknown'),
-            font=("Segoe UI Black", 16), text_color=cfg.get_color("text_main")
-        ).pack(pady=(20, 4))
-        ctk.CTkLabel(
-            self, text=game_data.get('path', ''),
-            font=("Consolas", 9), text_color=cfg.get_color("text_muted")
-        ).pack(pady=(0, 15))
-
-        frm = ctk.CTkFrame(
-            self, fg_color=cfg.get_color("card_base"),
-            corner_radius=cfg.get_radius("card"),
-            border_width=1, border_color=cfg.get_color("border")
-        )
-        frm.pack(fill="x", padx=20, pady=5)
-
-        def add_row(r, k, v):
-            ctk.CTkLabel(frm, text=k, font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("text_muted")).grid(row=r, column=0, sticky="w", padx=15, pady=4)
-            ctk.CTkLabel(frm, text=v, font=("Consolas", 11), text_color=cfg.get_color("text_main")).grid(row=r, column=1, sticky="w", padx=15, pady=4)
-
-        add_row(0, t("game_id"), game_data.get('id', 'N/A'))
-        add_row(1, t("game_format"), f"{game_data.get('format', 'N/A')} ({game_data.get('media_type', 'DVD')})")
-        add_row(2, t("game_size"), game_data.get('size_str', 'N/A'))
-        add_row(3, t("game_region"), game_data.get('region', 'Unknown'))
-
-        cfg_frm = ctk.CTkFrame(self, fg_color="transparent")
-        cfg_frm.pack(fill="x", padx=20, pady=12)
-
-        ctk.CTkLabel(cfg_frm, text=t("cfg_vid"), font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w", pady=5)
-        self.var_video = ctk.StringVar(value=game_data.get('video_mode', 'Auto'))
-        ctk.CTkOptionMenu(
-            cfg_frm, variable=self.var_video, values=["Auto", "PAL", "NTSC"],
-            height=28, corner_radius=cfg.get_radius("entry")
-        ).grid(row=0, column=1, sticky="ew", padx=10, pady=5)
-
-        ctk.CTkLabel(cfg_frm, text=t("cfg_res"), font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", pady=5)
-        self.var_res = ctk.StringVar(value=game_data.get('resolution', 'Default'))
-        ctk.CTkOptionMenu(
-            cfg_frm, variable=self.var_res, values=["Default", "480p", "720p", "1080i", "1080p"],
-            height=28, corner_radius=cfg.get_radius("entry")
-        ).grid(row=1, column=1, sticky="ew", padx=10, pady=5)
-
-        ctk.CTkButton(
-            cfg_frm, text=t("cfg_save"), height=28, width=90,
-            fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"),
-            command=self.save_cfg
-        ).grid(row=0, column=2, rowspan=2, padx=(5, 0))
-
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", pady=10, padx=20)
-        rad = cfg.get_radius("button")
-        ctk.CTkButton(
-            btn_frame, text=t("lib_btn_test"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("accent"), corner_radius=rad,
-            command=lambda: PCSX2Integration.test_iso(game_data['path'], lambda e: messagebox.showerror(t("error"), e))
-        ).pack(side="left", expand=True, padx=(0, 5))
-        ctk.CTkButton(
-            btn_frame, text=t("lib_btn_inst"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("success"), corner_radius=rad,
-            command=self.send_to_install
-        ).pack(side="left", expand=True, padx=5)
-
-        btn_frame2 = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame2.pack(fill="x", pady=(0, 15), padx=20)
-        ctk.CTkButton(
-            btn_frame2, text=t("lib_btn_rem"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("danger"), corner_radius=rad, command=self.remove_game
-        ).pack(side="left", expand=True, padx=(0, 5))
-        ctk.CTkButton(
-            btn_frame2, text=t("lib_btn_close"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("border"), text_color=cfg.get_color("text_main"),
-            corner_radius=rad, command=self.destroy
-        ).pack(side="right", expand=True, padx=(5, 0))
-
-    def send_to_install(self):
-        self.destroy()
-        self.app.show("single_install")
-        if "single_install" in self.app.pages:
-            self.app.pages["single_install"].set_iso(self.game_data['path'])
-
-    def remove_game(self):
-        if messagebox.askyesno(t("confirm"), t("msg_remove_confirm")):
-            self.app.library.games = [g for g in self.app.library.games if g['path'] != self.game_data['path']]
-            db.save()
-            sound_fx.play_success()
-            self.app.refresh_all()
-            self.destroy()
-
-    def save_cfg(self):
-        self.game_data['video_mode'] = self.var_video.get()
-        self.game_data['resolution'] = self.var_res.get()
-        self.app.library.add(self.game_data)
-        cfg_dir = os.path.join(os.path.dirname(os.path.dirname(self.game_data['path'])), "CFG")
-        try:
-            os.makedirs(cfg_dir, exist_ok=True)
-            cfg_file = os.path.join(cfg_dir, f"{self.game_data['id']}.cfg")
-            content = []
-            v, r = self.var_video.get(), self.var_res.get()
-            if v != "Auto" or r != "Default":
-                content.append("$EnableGSM=1")
-                if r == "720p": content.append("$GSMVMode=10")
-                elif r == "1080i": content.append("$GSMVMode=13")
-                elif r == "1080p": content.append("$GSMVMode=14")
-                elif r == "480p": content.append("$GSMVMode=3")
-                elif v == "NTSC": content.append("$GSMVMode=1")
-                elif v == "PAL": content.append("$GSMVMode=2")
-            with open(cfg_file, "w", encoding="utf-8") as f:
-                f.write("\n".join(content))
-            sound_fx.play_success()
-            messagebox.showinfo(t("success"), f"{t('cfg_save')} - {self.game_data['id']}")
-        except Exception as e:
-            sound_fx.play_error()
-            messagebox.showerror(t("error"), str(e))
-
-class CheatEditorModal(ctk.CTkToplevel):
-    def __init__(self, master, app, cht_folder, edit_file=None):
-        super().__init__(master)
-        self.title("PS2Manager Cheats")
-        self.geometry("600x580")
-        self.configure(fg_color=cfg.get_color("bg_main"))
-        self.attributes("-topmost", True)
-        apply_window_icon(self)
-        self.after(80, lambda: apply_window_icon(self))
-
-        self.app, self.cht_folder, self.edit_file = app, cht_folder, edit_file
-        games_list = app.library.games
-        if not self.edit_file:
-            ctk.CTkLabel(self, text=t("cht_sel_game"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("accent")).pack(pady=(20, 5), padx=20, anchor="w")
-            self.cmb_games = ctk.CTkComboBox(
-                self, values=[t("cht_manual")] + [f"{g.get('id', 'Unknown')} - {g.get('name', 'Unknown')}" for g in games_list],
-                command=self.on_game_select, fg_color=cfg.get_color("bg_main"), border_color=cfg.get_color("border"), corner_radius=cfg.get_radius("entry")
-            )
-            self.cmb_games.pack(fill="x", padx=20)
-
-        ctk.CTkLabel(self, text=t("cht_name"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(pady=(15, 5), padx=20, anchor="w")
-        self.ent_name = ctk.CTkEntry(self, font=("Consolas", 12), fg_color=cfg.get_color("card_base"), border_color=cfg.get_color("border"), corner_radius=cfg.get_radius("entry"))
-        self.ent_name.pack(fill="x", padx=20)
-
-        ctk.CTkLabel(self, text="Cheat Codes (RAW):", font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(pady=(15, 5), padx=20, anchor="w")
-        self.txt_codes = ctk.CTkTextbox(
-            self, font=("Consolas", 12), fg_color=cfg.get_color("card_base"),
-            border_color=cfg.get_color("border"), border_width=cfg.get_border_width(),
-            text_color=cfg.get_color("text_main"), corner_radius=cfg.get_radius("card")
-        )
-        self.txt_codes.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-
-        ctk.CTkButton(self, text=t("cht_save"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("success"), height=40, corner_radius=cfg.get_radius("button"), command=self.save).pack(fill="x", padx=20, pady=(0, 20))
-
-        if self.edit_file:
-            base_name = os.path.basename(self.edit_file)
-            if base_name.endswith('.disabled'): base_name = base_name[:-9]
-            if base_name.endswith('.cht'): base_name = base_name[:-4]
-            self.ent_name.insert(0, base_name)
-            try:
-                with open(self.edit_file, 'r', encoding='utf-8') as f:
-                    self.txt_codes.insert("0.0", f.read())
-            except Exception as e:
-                messagebox.showerror(t("error"), str(e))
-
-    def on_game_select(self, val):
-        if val == t("cht_manual"): return
-        game_id = val.split(" - ")[0]
-        game_name = val.split(" - ", 1)[1] if " - " in val else ""
-        self.ent_name.delete(0, 'end')
-        self.ent_name.insert(0, game_id)
-        if not self.txt_codes.get("0.0", "end").strip():
-            self.txt_codes.insert("0.0", f"// Cheat name: {game_name}\n\n")
-
-    def save(self):
-        name = self.ent_name.get().strip()
-        if not name: return
-        if not name.lower().endswith(".cht"): name += ".cht"
-        if self.edit_file and self.edit_file.endswith(".disabled"): name += ".disabled"
-        out_path = os.path.join(self.cht_folder, name)
-        try:
-            if self.edit_file and os.path.abspath(self.edit_file) != os.path.abspath(out_path) and os.path.exists(self.edit_file):
-                os.remove(self.edit_file)
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(self.txt_codes.get("0.0", "end"))
-            sound_fx.play_success()
-            messagebox.showinfo(t("success"), t("cht_succ"))
-            self.app.refresh_all()
-            self.destroy()
-        except Exception as e:
-            sound_fx.play_error()
-            messagebox.showerror(t("error"), f"{t('cht_err')} {e}")
-
-class AddCheatModal(ctk.CTkToplevel):
-    def __init__(self, master, app, cht_folder):
-        super().__init__(master)
-        self.title(t("cht_add"))
-        self.geometry("350x250")
-        self.configure(fg_color=cfg.get_color("bg_main"))
-        self.attributes("-topmost", True)
-        apply_window_icon(self)
-        self.after(80, lambda: apply_window_icon(self))
-
-        self.app, self.cht_folder = app, cht_folder
-        ctk.CTkLabel(self, text=t("cht_add"), font=("Segoe UI", 16, "bold"), text_color=cfg.get_color("text_main")).pack(pady=(20, 30))
-        r = cfg.get_radius("button")
-        ctk.CTkButton(self, text=t("cht_import"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=40, corner_radius=r, command=self.import_cht).pack(fill="x", padx=40, pady=10)
-        ctk.CTkButton(self, text=t("cht_create"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("success"), height=40, corner_radius=r, command=self.create_scratch).pack(fill="x", padx=40, pady=10)
-
-    def import_cht(self):
-        f = filedialog.askopenfilename(filetypes=[("Cheat Files", "*.cht")])
-        if f:
-            try:
-                shutil.copy2(f, self.cht_folder)
-                sound_fx.play_success()
-                self.app.refresh_all()
-                self.destroy()
-            except Exception as e:
-                sound_fx.play_error()
-                messagebox.showerror(t("error"), f"{t('cht_err')} {e}")
-
-    def create_scratch(self):
-        self.destroy()
-        CheatEditorModal(self.master, self.app, self.cht_folder)
-
-class CheatManagerPage(ctk.CTkFrame):
-    """Gerenciador completo de Cheats .cht (RAW) para Open PS2 Loader e PS2RD."""
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app, self.current_folder, self.selected_file = app, cfg.data.get("last_cht_folder", ""), None
-        self.grid_rowconfigure(3, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-        head = ctk.CTkFrame(self, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", pady=(0, 15))
-        ctk.CTkLabel(head, text=t("tab_cht"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).pack(side="left")
-
-        folder_frm = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"), corner_radius=cfg.get_radius("card"))
-        folder_frm.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        ctk.CTkLabel(folder_frm, text=t("cht_folder"), font=("Segoe UI", 11, "bold")).pack(side="left", padx=15, pady=10)
-        self.ent_folder = ctk.CTkEntry(folder_frm, fg_color=cfg.get_color("bg_main"), height=28, corner_radius=cfg.get_radius("entry"))
-        self.ent_folder.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=10)
-        if self.current_folder:
-            self.ent_folder.insert(0, self.current_folder)
-        ctk.CTkButton(folder_frm, text=t("btn_browse"), font=("Segoe UI", 11, "bold"), width=80, fg_color=cfg.get_color("border"), corner_radius=cfg.get_radius("button"), command=self.browse).pack(side="left", padx=(0, 15), pady=10)
-
-        act_frm = ctk.CTkFrame(self, fg_color="transparent")
-        act_frm.grid(row=2, column=0, sticky="new", pady=(0, 10))
-        r = cfg.get_radius("button")
-        ctk.CTkButton(act_frm, text=t("cht_add"), font=("Segoe UI", 11, "bold"), fg_color=cfg.get_color("accent"), corner_radius=r, command=lambda: AddCheatModal(self, self.app, self.current_folder) if (self.current_folder and os.path.exists(self.current_folder)) else messagebox.showerror(t("error"), "Select folder first")).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(act_frm, text=t("cht_edit"), font=("Segoe UI", 11, "bold"), fg_color=cfg.get_color("warning"), text_color="#000", corner_radius=r, command=lambda: CheatEditorModal(self, self.app, self.current_folder, self.selected_file) if self.selected_file else messagebox.showwarning(t("warning"), t("cht_none"))).pack(side="left", padx=5)
-        ctk.CTkButton(act_frm, text=t("cht_enable"), font=("Segoe UI", 11, "bold"), fg_color=cfg.get_color("success"), corner_radius=r, command=self.enable_cheat).pack(side="left", padx=5)
-        ctk.CTkButton(act_frm, text=t("cht_disable"), font=("Segoe UI", 11, "bold"), fg_color=cfg.get_color("danger"), corner_radius=r, command=self.disable_cheat).pack(side="left", padx=5)
-
-        self.list_frm = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.list_frm.grid(row=3, column=0, sticky="nsew")
-        self.refresh()
-
-    def browse(self):
-        d = filedialog.askdirectory()
-        if d:
-            self.ent_folder.delete(0, 'end')
-            self.ent_folder.insert(0, d)
-            self.current_folder = d
-            cfg.data["last_cht_folder"] = d
-            cfg.save()
-            self.refresh()
-
-    def refresh(self):
-        self.current_folder = self.ent_folder.get()
-        if not self.current_folder or not os.path.exists(self.current_folder):
-            return
-        self.selected_file = None
-        for w in self.list_frm.winfo_children():
-            w.destroy()
-        try:
-            for f in os.listdir(self.current_folder):
-                if f.lower().endswith((".cht", ".disabled")):
-                    self.add_cheat_card(f)
-        except Exception:
-            pass
-
-    def add_cheat_card(self, filename):
-        is_disabled = filename.lower().endswith(".disabled")
-        color = cfg.get_color("danger") if is_disabled else cfg.get_color("success")
-        card = ctk.CTkFrame(
-            self.list_frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"),
-            height=36, border_width=cfg.get_border_width(), border_color=cfg.get_color("border")
-        )
-        card.pack(fill="x", pady=2)
-        card.pack_propagate(False)
-        card.grid_columnconfigure(1, weight=1)
-        card.grid_rowconfigure(0, weight=1)
-        ctk.CTkFrame(card, width=4, fg_color=color, corner_radius=0).grid(row=0, column=0, sticky="ns", padx=(0, 10))
-        ctk.CTkLabel(card, text=filename, font=("Consolas", 12, "bold"), text_color=cfg.get_color("text_main")).grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(card, text=t("cht_disabled") if is_disabled else t("cht_enabled"), font=("Segoe UI", 10, "bold"), text_color=color).grid(row=0, column=2, sticky="e", padx=15)
-
-        def on_click(e, f=filename, c=card):
-            self.selected_file = os.path.join(self.current_folder, f)
-            for w in self.list_frm.winfo_children():
-                w.configure(fg_color=cfg.get_color("card_base"), border_color=cfg.get_color("border"))
-            c.configure(fg_color=cfg.get_color("card_hover"), border_color=cfg.get_color("accent"))
-            sound_fx.play_click()
-
-        card.bind("<Button-1>", on_click)
-        for child in card.winfo_children():
-            child.bind("<Button-1>", on_click)
-
-    def enable_cheat(self):
-        if self.selected_file and self.selected_file.endswith(".disabled"):
-            try:
-                os.rename(self.selected_file, self.selected_file[:-9])
-                sound_fx.play_success()
-                self.refresh()
-            except Exception as e:
-                messagebox.showerror(t("error"), str(e))
-
-    def disable_cheat(self):
-        if self.selected_file and self.selected_file.endswith(".cht"):
-            try:
-                os.rename(self.selected_file, self.selected_file + ".disabled")
-                sound_fx.play_success()
-                self.refresh()
-            except Exception as e:
-                messagebox.showerror(t("error"), str(e))
-
+# ==============================================================================
+# PAINEL PRINCIPAL (DASHBOARD), BIBLIOTECA & INSTALAÇÃO UNIFICADA NO USB
+# ==============================================================================
 class DashboardPage(ctk.CTkFrame):
     def __init__(self, master, app):
         super().__init__(master, fg_color="transparent")
         self.app = app
-        self.grid_columnconfigure((0, 1, 2), weight=1)
+        self.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        self.grid_rowconfigure(4, weight=1)
+
+        PageHeader(self, t("tab_dash"), t("dash_sub"), badge_text=APP_VERSION).grid(
+            row=0, column=0, columnspan=4, sticky="ew", pady=(0, 16)
+        )
+
+        self.card_games = self._stat_card(0, t("dash_games"), "0", cfg.get_color("accent"))
+        self.card_usb = self._stat_card(1, t("dash_usb"), "0", cfg.get_color("success"))
+        self.card_size = self._stat_card(2, t("dash_size"), "0 B", cfg.get_color("warning"))
+        self.card_console = self._stat_card(
+            3, t("dash_console"),
+            f"{cfg.data.get('ps2_type', 'SLIM')}",
+            cfg.get_color("highlight")
+        )
 
         ctk.CTkLabel(
-            self, text=t("tab_dash"), font=("Segoe UI Black", 18),
-            text_color=cfg.get_color("text_main")
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 15))
+            self, text=t("dash_quick"), font=("Segoe UI", 11, "bold"),
+            text_color=cfg.get_color("text_muted")
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(18, 6))
 
-        self.card_games = self.create_card(0, t("dash_games"), "0", cfg.get_color("accent"))
-        self.card_usb = self.create_card(1, t("dash_usb"), "0", cfg.get_color("success"))
-        self.card_size = self.create_card(2, t("dash_size"), "0 GB", cfg.get_color("warning"))
+        q_bar = ctk.CTkFrame(self, fg_color="transparent")
+        q_bar.grid(row=3, column=0, columnspan=4, sticky="ew")
+        q_bar.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-    def create_card(self, col, title, initial_val, color):
-        c = HoverCard(
+        quick_actions = [
+            (f"📥  {t('tab_install')}", "install", cfg.get_color("accent")),
+            (f"🛡  {t('usb_mode_defrag')}", "usb_defrag", cfg.get_color("success")),
+            (f"⚙  {t('tab_opl_cfg')}", "opl_cfg", cfg.get_color("chip_bg")),
+            (f"💾  {t('tab_mc')}", "mc", cfg.get_color("chip_bg"))
+        ]
+        for idx, (label, target_key, col) in enumerate(quick_actions):
+            ctk.CTkButton(
+                q_bar, text=label, height=40, font=("Segoe UI", 11, "bold"),
+                fg_color=col, hover_color=cfg.get_hover("accent_hover", "card_base"),
+                corner_radius=cfg.get_radius("button"),
+                command=lambda k=target_key: self._jump(k)
+            ).grid(row=0, column=idx, sticky="ew", padx=4)
+
+        self.usb_panel = ctk.CTkScrollableFrame(
             self, fg_color=cfg.get_color("card_base"),
-            corner_radius=cfg.get_radius("card"), height=100,
-            border_width=1, border_color=cfg.get_color("border")
+            corner_radius=cfg.get_radius("card"),
+            border_width=cfg.get_border_width(), border_color=cfg.get_color("border"),
+            label_text=t("dash_storage"), label_font=("Segoe UI", 11, "bold"),
+            label_text_color=cfg.get_color("highlight")
         )
-        c.grid(row=1, column=col, padx=6, sticky="nsew")
-        c.pack_propagate(False)
+        self.usb_panel.grid(row=4, column=0, columnspan=4, sticky="nsew", pady=(16, 0))
 
-        ctk.CTkLabel(c, text=title, font=("Segoe UI", 11, "bold"), text_color=color).pack(pady=(15, 2))
+    def _jump(self, key):
+        if key == "usb_defrag":
+            self.app.show("usb")
+            if "usb" in self.app.pages:
+                self.app.pages["usb"].switch_to_defrag()
+        else:
+            self.app.show(key)
+
+    def _stat_card(self, col, title, initial_val, color):
+        c = HoverCard(self, fg_color=cfg.get_color("card_base"), height=104)
+        c.grid(row=1, column=col, padx=5, sticky="nsew")
+        c.pack_propagate(False)
+        ctk.CTkFrame(c, height=3, fg_color=color, corner_radius=0).pack(fill="x")
+        ctk.CTkLabel(c, text=title, font=("Segoe UI", 10, "bold"), text_color=color).pack(pady=(14, 4), padx=10)
         lbl_val = ctk.CTkLabel(c, text=initial_val, font=("Segoe UI Black", 22), text_color=cfg.get_color("text_main"))
         lbl_val.pack()
-        c.bind_children(c)
+        c.bind_children()
         return lbl_val
 
     def refresh(self):
@@ -834,6 +133,27 @@ class DashboardPage(ctk.CTkFrame):
         self.card_usb.configure(text=str(len(drives)))
         total_b = sum(g.get('size_bytes', 0) for g in games)
         self.card_size.configure(text=format_size(total_b))
+        self.card_console.configure(text=f"{cfg.data.get('ps2_model', 'PS2')}")
+
+        for w in self.usb_panel.winfo_children():
+            w.destroy()
+        if not drives:
+            ctk.CTkLabel(
+                self.usb_panel, text=t("dash_no_usb"),
+                font=("Segoe UI", 12), text_color=cfg.get_color("text_muted")
+            ).pack(pady=30)
+            return
+        for d in drives:
+            row = ctk.CTkFrame(self.usb_panel, fg_color=cfg.get_color("bg_main"), corner_radius=cfg.get_radius("chip"))
+            row.pack(fill="x", padx=8, pady=5)
+            top = ctk.CTkFrame(row, fg_color="transparent")
+            top.pack(fill="x", padx=14, pady=(8, 4))
+            ctk.CTkLabel(top, text=f"🔌 {d['mountpoint']} [{d['fstype']}]", font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(side="left")
+            ctk.CTkLabel(top, text=f"{d['used_str']} / {d['total_str']} ({d['free_str']} free)", font=("Consolas", 11), text_color=cfg.get_color("highlight")).pack(side="right")
+            pb = ctk.CTkProgressBar(row, height=7, progress_color=cfg.get_color("accent"))
+            pb.pack(fill="x", padx=14, pady=(0, 10))
+            pb.set(min(1.0, d["percent"] / 100.0))
+
 
 class GamesPage(ctk.CTkFrame):
     def __init__(self, master, app):
@@ -842,630 +162,429 @@ class GamesPage(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
 
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        def build_actions(box):
+            ctk.CTkButton(
+                box, text=t("lib_add_iso"), font=("Segoe UI", 11, "bold"),
+                height=34, corner_radius=cfg.get_radius("button"),
+                fg_color=cfg.get_color("chip_bg"), hover_color=cfg.get_hover("card_hover", "chip_bg"),
+                command=self.add_single_file
+            ).pack(side="left", padx=(0, 8))
+            ctk.CTkButton(
+                box, text=t("lib_scan"), font=("Segoe UI", 11, "bold"),
+                height=34, corner_radius=cfg.get_radius("button"),
+                fg_color=cfg.get_color("accent"), hover_color=cfg.get_hover("accent_hover", "accent"),
+                command=self.scan_folder
+            ).pack(side="left")
 
-        ctk.CTkLabel(header, text=t("tab_lib"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).pack(side="left")
-        ctk.CTkButton(
-            header, text=t("lib_scan"), font=("Segoe UI", 11, "bold"),
-            height=32, corner_radius=cfg.get_radius("button"),
-            fg_color=cfg.get_color("accent"), hover_color=cfg.get_color("accent_hover"),
-            command=self.scan_folder
-        ).pack(side="right")
+        PageHeader(self, t("tab_lib"), t("lib_sub"), right_widget_builder=build_actions).grid(
+            row=0, column=0, sticky="ew", pady=(0, 12)
+        )
 
-        f_search = ctk.CTkFrame(self, fg_color="transparent")
-        f_search.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self._search_job = None
+        self._last_render_sig = None
 
         self.ent_search = ctk.CTkEntry(
-            f_search, placeholder_text=t("lib_search"),
+            self, placeholder_text=t("lib_search"),
             fg_color=cfg.get_color("card_base"), border_color=cfg.get_color("border"),
-            height=36, corner_radius=cfg.get_radius("entry")
+            height=38, corner_radius=cfg.get_radius("entry")
         )
-        self.ent_search.pack(fill="x")
-        self.ent_search.bind("<KeyRelease>", lambda e: self.render_list())
+        self.ent_search.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.ent_search.bind("<KeyRelease>", self._on_search_key)
 
         self.list_box = ctk.CTkScrollableFrame(
             self, fg_color=cfg.get_color("card_base"),
-            corner_radius=cfg.get_radius("card"), border_width=1,
-            border_color=cfg.get_color("border")
+            corner_radius=cfg.get_radius("card"),
+            border_width=cfg.get_border_width(), border_color=cfg.get_color("border")
         )
         self.list_box.grid(row=2, column=0, sticky="nsew")
 
+    def _on_search_key(self, _e=None):
+        if self._search_job:
+            try:
+                self.after_cancel(self._search_job)
+            except Exception:
+                pass
+        self._search_job = self.after(110, self.render_list)
+
+    def add_single_file(self):
+        sound_fx.play_click()
+        files = filedialog.askopenfilenames(filetypes=[(t("iso_files"), "*.iso *.zso *.bin")])
+        if files:
+            for f in files:
+                try:
+                    self.app.library.add(GameAnalyzer.analyze(f))
+                except Exception:
+                    pass
+            sound_fx.play_success()
+            self._last_render_sig = None
+            self.app.refresh_all()
+
     def scan_folder(self):
+        sound_fx.play_click()
         p = filedialog.askdirectory()
         if p:
             self.app.library.scan_directory(p)
             sound_fx.play_success()
+            self._last_render_sig = None
             NotificationPopup(self.app, t("lib_scan_done"), "success")
-            self.render_list()
+            self.app.refresh_all()
 
     def refresh(self):
         self.render_list()
 
-    def render_list(self):
+    def render_list(self, force=False):
+        self._search_job = None
+        q = self.ent_search.get().lower().strip()
+        sig = (
+            q,
+            tuple((g.get('path'), g.get('name'), g.get('id'), g.get('size_bytes')) for g in self.app.library.games)
+        )
+        if not force and sig == self._last_render_sig:
+            return
+        self._last_render_sig = sig
+
         for w in self.list_box.winfo_children():
             w.destroy()
-        q = self.ent_search.get().lower().strip()
-        games = [g for g in self.app.library.games if q in g.get('name', '').lower() or q in g.get('id', '').lower()]
+        games = [
+            g for g in self.app.library.games
+            if q in g.get('name', '').lower() or q in g.get('id', '').lower() or q in g.get('region', '').lower()
+        ]
+        if not games:
+            ctk.CTkLabel(
+                self.list_box, text=t("lib_empty"),
+                font=("Segoe UI", 12), text_color=cfg.get_color("text_muted")
+            ).pack(pady=50)
+            return
         for g in games:
             card = HoverCard(
-                self.list_box, height=44, corner_radius=cfg.get_radius("chip"),
+                self.list_box, height=50, corner_radius=cfg.get_radius("chip"),
                 fg_color=cfg.get_color("bg_main"), hover_color=cfg.get_color("card_hover"),
                 command=lambda gd=g: GameDetailsModal(self.app, gd)
             )
-            card.pack(fill="x", pady=3, padx=4)
+            card.pack(fill="x", pady=3, padx=6)
             card.pack_propagate(False)
 
-            ctk.CTkLabel(card, text=g.get('name', 'Unknown'), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(side="left", padx=12)
-            ctk.CTkLabel(card, text=g.get('id', 'N/A'), font=("Consolas", 11, "bold"), text_color=cfg.get_color("accent")).pack(side="left", padx=10)
-            ctk.CTkLabel(card, text=g.get('size_str', ''), font=("Consolas", 10), text_color=cfg.get_color("text_muted")).pack(side="right", padx=15)
-            card.bind_children(card)
+            ctk.CTkFrame(card, width=4, fg_color=cfg.get_color("accent"), corner_radius=0).pack(side="left", fill="y", padx=(0, 12))
+            ctk.CTkLabel(card, text=g.get('name', 'Unknown'), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(side="left", padx=(0, 10))
+            ctk.CTkLabel(card, text=g.get('id', 'N/A'), font=("Consolas", 11, "bold"), text_color=cfg.get_color("highlight")).pack(side="left", padx=6)
+            ctk.CTkLabel(card, text=f"{g.get('region', '')} • {g.get('format', '')} • {g.get('size_str', '')}", font=("Consolas", 10), text_color=cfg.get_color("text_muted")).pack(side="right", padx=16)
+            card.bind_children()
 
-class SingleInstallPage(ctk.CTkFrame):
-    """Instalador 1-Clique inteligente para pendrive/HD USB 100% localizado."""
+
+class UnifiedInstallPage(ctk.CTkFrame):
+    """Unifica Instalação 1-Clique, Fila em Lote e USBUtil (FAT32 >4GB) sem poluir a barra lateral!"""
     def __init__(self, master, app):
         super().__init__(master, fg_color="transparent")
         self.app = app
+        self.queue_items = []
+        self.batch_worker = None
+
         self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self, text=t("tab_install"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
+        self.grid_rowconfigure(2, weight=1)
 
-        frm = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), border_width=1, border_color=cfg.get_color("border"), corner_radius=cfg.get_radius("card"))
-        frm.grid(row=1, column=0, sticky="nsew")
+        PageHeader(self, t("tab_install"), t("inst_sub"), badge_text="FAT32 & exFAT").grid(
+            row=0, column=0, sticky="ew", pady=(0, 12)
+        )
 
-        ctk.CTkLabel(frm, text=t("inst_step1"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(anchor="w", padx=20, pady=(20, 5))
-        f_iso = ctk.CTkFrame(frm, fg_color="transparent")
-        f_iso.pack(fill="x", padx=20)
-        self.ent_iso = ctk.CTkEntry(f_iso, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry"))
-        self.ent_iso.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f_iso, text=t("btn_select"), width=90, corner_radius=cfg.get_radius("button"), command=self.browse_iso).pack(side="left", padx=10)
+        self.modes = [t("inst_mode_single"), t("inst_mode_batch"), t("inst_mode_split")]
+        self.seg = create_segmented_tabs(self, self.modes, self.switch_submode)
+        self.seg.grid(row=1, column=0, sticky="ew", pady=(0, 12))
 
-        ctk.CTkLabel(frm, text=t("inst_step2"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(anchor="w", padx=20, pady=(15, 5))
-        self.ent_name = ctk.CTkEntry(frm, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry"))
-        self.ent_name.pack(fill="x", padx=20)
+        self.body = ctk.CTkFrame(self, fg_color="transparent")
+        self.body.grid(row=2, column=0, sticky="nsew")
+        self.body.grid_columnconfigure(0, weight=1)
+        self.body.grid_rowconfigure(0, weight=1)
 
-        ctk.CTkLabel(frm, text=t("inst_step3"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(anchor="w", padx=20, pady=(15, 5))
-        self.var_drive = ctk.StringVar(value="Select USB...")
-        self.cmb_drive = ctk.CTkOptionMenu(frm, variable=self.var_drive, values=["Select USB..."], height=32, corner_radius=cfg.get_radius("entry"))
-        self.cmb_drive.pack(fill="x", padx=20)
+        self.f_single = ctk.CTkFrame(self.body, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
+        self.f_batch = ctk.CTkFrame(self.body, fg_color="transparent")
+        self.f_split = ctk.CTkFrame(self.body, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
+
+        self._build_single()
+        self._build_batch()
+        self._build_split()
+        self.switch_submode(self.modes[0])
+
+    def _build_single(self):
+        ctk.CTkLabel(self.f_single, text=t("inst_step1"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(20, 5))
+        f_iso = ctk.CTkFrame(self.f_single, fg_color="transparent")
+        f_iso.pack(fill="x", padx=22)
+        self.ent_iso = ctk.CTkEntry(f_iso, fg_color=cfg.get_color("bg_main"), height=34, corner_radius=cfg.get_radius("entry"))
+        self.ent_iso.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(f_iso, text=t("btn_select"), width=95, height=34, corner_radius=cfg.get_radius("button"), command=self.browse_iso).pack(side="left")
+
+        ctk.CTkLabel(self.f_single, text=t("inst_step2"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(14, 5))
+        self.ent_name = ctk.CTkEntry(self.f_single, fg_color=cfg.get_color("bg_main"), height=34, corner_radius=cfg.get_radius("entry"))
+        self.ent_name.pack(fill="x", padx=22)
+
+        ctk.CTkLabel(self.f_single, text=t("inst_step3"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(14, 5))
+        self.var_drive = ctk.StringVar(value=t("inst_err_nodrive"))
+        self.cmb_drive = ctk.CTkOptionMenu(self.f_single, variable=self.var_drive, values=[t("inst_err_nodrive")], height=34, corner_radius=cfg.get_radius("entry"), command=lambda _: sound_fx.play_click())
+        self.cmb_drive.pack(fill="x", padx=22)
 
         self.var_art = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(frm, text=t("inst_auto_art"), variable=self.var_art, font=("Segoe UI", 12)).pack(anchor="w", padx=20, pady=15)
+        ctk.CTkCheckBox(self.f_single, text=t("inst_auto_art"), variable=self.var_art, font=("Segoe UI", 12), command=sound_fx.play_click).pack(anchor="w", padx=22, pady=15)
 
-        self.btn_install = ctk.CTkButton(frm, text=t("inst_btn"), font=("Segoe UI", 13, "bold"), height=42, fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"), command=self.start_install)
-        self.btn_install.pack(pady=20, padx=20, fill="x")
+        self.btn_install = ctk.CTkButton(
+            self.f_single, text=t("inst_btn"), font=("Segoe UI", 13, "bold"),
+            height=44, fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"),
+            command=self.start_install
+        )
+        self.btn_install.pack(pady=(6, 12), padx=22, fill="x")
 
-        self.lbl_status = ctk.CTkLabel(frm, text=t("inst_ready"), font=("Segoe UI", 11), text_color=cfg.get_color("text_muted"))
-        self.lbl_status.pack(pady=(0, 5))
-
-        self.prog = ctk.CTkProgressBar(frm, progress_color=cfg.get_color("highlight"))
-        self.prog.pack(fill="x", padx=20, pady=(0, 20))
+        self.lbl_status = ctk.CTkLabel(self.f_single, text=t("inst_ready"), font=("Segoe UI", 11), text_color=cfg.get_color("text_muted"))
+        self.lbl_status.pack(pady=(0, 4))
+        self.prog = ctk.CTkProgressBar(self.f_single, progress_color=cfg.get_color("highlight"))
+        self.prog.pack(fill="x", padx=22, pady=(0, 20))
         self.prog.set(0)
 
+    def _build_batch(self):
+        self.f_batch.grid_columnconfigure(0, weight=1)
+        self.f_batch.grid_rowconfigure(1, weight=1)
+
+        b_top = ctk.CTkFrame(self.f_batch, fg_color="transparent")
+        b_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ctk.CTkButton(b_top, text=t("batch_add"), height=32, corner_radius=cfg.get_radius("button"), command=self.add_batch_files).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(b_top, text=t("batch_folder"), height=32, corner_radius=cfg.get_radius("button"), command=self.add_batch_folder).pack(side="left", padx=6)
+        ctk.CTkButton(b_top, text=t("batch_clear"), height=32, fg_color=cfg.get_color("danger"), corner_radius=cfg.get_radius("button"), command=self.clear_queue).pack(side="right")
+
+        self.batch_list = ctk.CTkScrollableFrame(self.f_batch, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
+        self.batch_list.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
+
+        b_bot = ctk.CTkFrame(self.f_batch, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
+        b_bot.grid(row=2, column=0, sticky="ew")
+
+        drv_r = ctk.CTkFrame(b_bot, fg_color="transparent")
+        drv_r.pack(fill="x", padx=16, pady=(12, 8))
+        ctk.CTkLabel(drv_r, text=t("inst_step3"), font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 10))
+        self.var_b_drv = ctk.StringVar(value=t("inst_err_nodrive"))
+        self.cmb_b_drv = ctk.CTkOptionMenu(drv_r, variable=self.var_b_drv, values=[t("inst_err_nodrive")], height=30, corner_radius=cfg.get_radius("entry"), command=lambda _: sound_fx.play_click())
+        self.cmb_b_drv.pack(side="left", fill="x", expand=True)
+        self.var_b_art = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(drv_r, text=t("inst_auto_art"), variable=self.var_b_art, font=("Segoe UI", 11), command=sound_fx.play_click).pack(side="left", padx=14)
+
+        self.prog_b_total = ctk.CTkProgressBar(b_bot, progress_color=cfg.get_color("accent"))
+        self.prog_b_total.pack(fill="x", padx=16, pady=(2, 6))
+        self.prog_b_total.set(0)
+        self.prog_b_item = ctk.CTkProgressBar(b_bot, progress_color=cfg.get_color("highlight"))
+        self.prog_b_item.pack(fill="x", padx=16, pady=(0, 10))
+        self.prog_b_item.set(0)
+
+        self.btn_batch = ctk.CTkButton(b_bot, text=t("batch_start"), height=40, font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"), command=self.start_batch)
+        self.btn_batch.pack(fill="x", padx=16, pady=(0, 14))
+        self.refresh_queue_view()
+
+    def _build_split(self):
+        ctk.CTkLabel(self.f_split, text=t("util_iso"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(20, 5))
+        r1 = ctk.CTkFrame(self.f_split, fg_color="transparent")
+        r1.pack(fill="x", padx=22)
+        self.ent_u_iso = ctk.CTkEntry(r1, fg_color=cfg.get_color("bg_main"), height=34, corner_radius=cfg.get_radius("entry"))
+        self.ent_u_iso.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(r1, text=t("btn_browse"), width=95, height=34, corner_radius=cfg.get_radius("button"), command=self.browse_split_iso).pack(side="left")
+
+        ctk.CTkLabel(self.f_split, text=t("util_dst"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(14, 5))
+        r2 = ctk.CTkFrame(self.f_split, fg_color="transparent")
+        r2.pack(fill="x", padx=22)
+        self.ent_u_dst = ctk.CTkEntry(r2, fg_color=cfg.get_color("bg_main"), height=34, corner_radius=cfg.get_radius("entry"))
+        self.ent_u_dst.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(r2, text=t("btn_browse"), width=95, height=34, corner_radius=cfg.get_radius("button"), command=lambda: [sound_fx.play_click(), self._set_entry(self.ent_u_dst, filedialog.askdirectory())]).pack(side="left")
+
+        ctk.CTkLabel(self.f_split, text=t("util_name"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(14, 5))
+        self.ent_u_name = ctk.CTkEntry(self.f_split, fg_color=cfg.get_color("bg_main"), height=34, corner_radius=cfg.get_radius("entry"))
+        self.ent_u_name.pack(fill="x", padx=22)
+
+        self.btn_split = ctk.CTkButton(self.f_split, text=t("util_btn"), height=42, font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), corner_radius=cfg.get_radius("button"), command=self.run_split)
+        self.btn_split.pack(fill="x", padx=22, pady=20)
+        self.prog_u = ctk.CTkProgressBar(self.f_split, progress_color=cfg.get_color("highlight"))
+        self.prog_u.pack(fill="x", padx=22, pady=(0, 20))
+        self.prog_u.set(0)
+
+    def _set_entry(self, ent, val):
+        if val:
+            ent.delete(0, "end")
+            ent.insert(0, val)
+
+    def switch_submode(self, val):
+        self.f_single.grid_forget()
+        self.f_batch.grid_forget()
+        self.f_split.grid_forget()
+        if val == self.modes[0]:
+            self.f_single.grid(row=0, column=0, sticky="nsew")
+        elif val == self.modes[1]:
+            self.f_batch.grid(row=0, column=0, sticky="nsew")
+        else:
+            self.f_split.grid(row=0, column=0, sticky="nsew")
+
     def set_iso(self, path):
+        self.seg.set(self.modes[0])
+        self.switch_submode(self.modes[0])
         self.ent_iso.delete(0, 'end')
         self.ent_iso.insert(0, path)
-        base_name = os.path.splitext(os.path.basename(path))[0]
         self.ent_name.delete(0, 'end')
-        self.ent_name.insert(0, base_name[:32])
+        self.ent_name.insert(0, GameAnalyzer.clean_display_title(os.path.basename(path))[:32])
 
     def browse_iso(self):
+        sound_fx.play_click()
         f = filedialog.askopenfilename(filetypes=[(t("iso_files"), "*.iso *.bin *.zso")])
         if f:
             self.set_iso(f)
 
+    def browse_split_iso(self):
+        sound_fx.play_click()
+        f = filedialog.askopenfilename(filetypes=[(t("iso_files"), "*.iso")])
+        if f:
+            self._set_entry(self.ent_u_iso, f)
+            self._set_entry(self.ent_u_name, GameAnalyzer.clean_display_title(os.path.basename(f))[:32])
+
     def refresh(self):
         drives = UsbDetector.get_removable_drives()
-        vals = [f"{d['mountpoint']} [{d['fstype']}] - {d['device']}" for d in drives]
-        if not vals: vals = [t("inst_err_nodrive")]
-        self.cmb_drive.configure(values=vals)
-        if self.var_drive.get() not in vals and vals:
-            self.var_drive.set(vals[0])
+        vals = [f"{d['mountpoint']} [{d['fstype']}] - {d['free_str']} free" for d in drives] or [t("inst_err_nodrive")]
+        for cmb, var in [(self.cmb_drive, self.var_drive), (self.cmb_b_drv, self.var_b_drv)]:
+            cmb.configure(values=vals)
+            if var.get() not in vals:
+                var.set(vals[0])
+        if drives and not self.ent_u_dst.get().strip():
+            self.ent_u_dst.insert(0, drives[0]["mountpoint"])
+
+    def _resolve_drive(self, drv_str):
+        if drv_str == t("inst_err_nodrive"):
+            return None
+        mp = drv_str.split(" ")[0]
+        return next((d for d in UsbDetector.get_removable_drives() if d['mountpoint'].upper() == mp.upper()), None)
 
     def start_install(self):
+        sound_fx.play_click()
         iso = self.ent_iso.get().strip()
-        drv_str = self.var_drive.get()
-        name = self.ent_name.get().strip()
-        if not iso or not os.path.exists(iso) or drv_str == t("inst_err_nodrive"):
+        target_d = self._resolve_drive(self.var_drive.get())
+        if not iso or not os.path.exists(iso) or not target_d:
+            sound_fx.play_error()
             messagebox.showerror(t("error"), t("inst_err_select"))
             return
-
-        mp = drv_str.split(" ")[0]
-        drives = UsbDetector.get_removable_drives()
-        target_d = next((d for d in drives if d['mountpoint'].upper() == mp.upper() or d['device'].upper() == mp.upper()), None)
-        if not target_d:
-            messagebox.showerror(t("error"), t("inst_err_nodrive"))
-            return
-
         self.btn_install.configure(state="disabled")
         self.prog.set(0)
         self.lbl_status.configure(text=t("inst_starting"))
 
-        def on_done(s):
-            self.app.after(0, lambda: [
+        SingleInstallWorker.install(
+            iso, target_d, self.ent_name.get().strip(), self.var_art.get(),
+            cb_prog=lambda v: self.app.after(0, lambda: self.prog.set(v)),
+            cb_done=lambda _: self.app.after(0, lambda: [
                 self.btn_install.configure(state="normal"),
                 self.prog.set(1.0),
                 self.lbl_status.configure(text=t("inst_done")),
                 sound_fx.play_success(),
                 messagebox.showinfo(t("success"), t("inst_succ_msg"))
-            ])
-
-        def on_err(e):
-            self.app.after(0, lambda: [
+            ]),
+            cb_err=lambda e: self.app.after(0, lambda: [
                 self.btn_install.configure(state="normal"),
-                self.lbl_status.configure(text=f"{t('error')}: {e}"),
                 sound_fx.play_error(),
                 messagebox.showerror(t("error"), f"{t('inst_err_fail')} {e}")
             ])
+        )
 
-        def on_prog(v):
-            self.app.after(0, lambda: self.prog.set(v))
-
-        SingleInstallWorker.install(iso, target_d, name, self.var_art.get(), on_prog, on_done, on_err)
-
-class BatchInstallPage(ctk.CTkFrame):
-    """Fila de processamento em lote para instalar múltiplos jogos de uma vez 100% localizada."""
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app = app
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-
-        self.queue_items = []
-        self.worker = None
-
-        header = ctk.CTkFrame(self, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        ctk.CTkLabel(header, text=t("tab_batch"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).pack(side="left")
-
-        btn_f = ctk.CTkFrame(header, fg_color="transparent")
-        btn_f.pack(side="right")
-        ctk.CTkButton(btn_f, text=f"+ {t('btn_browse')}", width=110, height=32, corner_radius=cfg.get_radius("button"), command=self.add_files).pack(side="left", padx=4)
-        ctk.CTkButton(btn_f, text=t("lib_scan"), width=120, height=32, corner_radius=cfg.get_radius("button"), command=self.add_folder).pack(side="left", padx=4)
-        ctk.CTkButton(btn_f, text=t("btn_cancel"), width=80, height=32, fg_color=cfg.get_color("danger"), corner_radius=cfg.get_radius("button"), command=self.clear_queue).pack(side="left", padx=4)
-
-        self.list_box = ctk.CTkScrollableFrame(self, fg_color=cfg.get_color("card_base"), border_width=1, border_color=cfg.get_color("border"), corner_radius=cfg.get_radius("card"))
-        self.list_box.grid(row=1, column=0, sticky="nsew", pady=5)
-
-        bottom = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), border_width=1, border_color=cfg.get_color("border"), corner_radius=cfg.get_radius("card"))
-        bottom.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-
-        drv_row = ctk.CTkFrame(bottom, fg_color="transparent")
-        drv_row.pack(fill="x", padx=15, pady=10)
-        ctk.CTkLabel(drv_row, text=t("inst_step3"), font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("text_main")).pack(side="left", padx=(0, 10))
-        self.var_drive = ctk.StringVar(value="Select USB...")
-        self.cmb_drive = ctk.CTkOptionMenu(drv_row, variable=self.var_drive, values=["Select USB..."], height=28, corner_radius=cfg.get_radius("entry"))
-        self.cmb_drive.pack(side="left", fill="x", expand=True)
-
-        self.var_art = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(drv_row, text=t("inst_auto_art"), variable=self.var_art, font=("Segoe UI", 11)).pack(side="left", padx=15)
-
-        prog_f = ctk.CTkFrame(bottom, fg_color="transparent")
-        prog_f.pack(fill="x", padx=15, pady=5)
-        ctk.CTkLabel(prog_f, text=t("batch_prog_total"), font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("text_main")).pack(anchor="w")
-        self.prog_total = ctk.CTkProgressBar(prog_f, progress_color=cfg.get_color("accent"))
-        self.prog_total.pack(fill="x", pady=(2, 6))
-        self.prog_total.set(0)
-
-        ctk.CTkLabel(prog_f, text=t("batch_prog_cur"), font=("Segoe UI", 11), text_color=cfg.get_color("text_muted")).pack(anchor="w")
-        self.prog_item = ctk.CTkProgressBar(prog_f, progress_color=cfg.get_color("highlight"))
-        self.prog_item.pack(fill="x", pady=(2, 10))
-        self.prog_item.set(0)
-
-        self.btn_start = ctk.CTkButton(bottom, text=t("tab_batch"), font=("Segoe UI", 12, "bold"), height=38, fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"), command=self.start_batch)
-        self.btn_start.pack(fill="x", padx=15, pady=(0, 12))
-        self.refresh_queue_view()
-
-    def add_files(self):
-        files = filedialog.askopenfilenames(filetypes=[(t("iso_files"), "*.iso *.bin *.zso")])
-        for f in files:
+    def add_batch_files(self):
+        sound_fx.play_click()
+        for f in filedialog.askopenfilenames(filetypes=[(t("iso_files"), "*.iso *.bin *.zso")]):
             if not any(x['path'] == f for x in self.queue_items):
-                sz = os.path.getsize(f)
-                self.queue_items.append({'path': f, 'name': os.path.splitext(os.path.basename(f))[0][:32], 'size': format_size(sz)})
+                self.queue_items.append({'path': f, 'name': GameAnalyzer.clean_display_title(os.path.basename(f))[:32], 'size': format_size(os.path.getsize(f))})
         self.refresh_queue_view()
 
-    def add_folder(self):
+    def add_batch_folder(self):
+        sound_fx.play_click()
         folder = filedialog.askdirectory()
         if folder:
             for root, _, files in os.walk(folder):
                 for f in files:
                     if f.lower().endswith(('.iso', '.bin', '.zso')):
-                        full_p = os.path.join(root, f)
-                        if not any(x['path'] == full_p for x in self.queue_items):
-                            sz = os.path.getsize(full_p)
-                            self.queue_items.append({'path': full_p, 'name': os.path.splitext(f)[0][:32], 'size': format_size(sz)})
+                        fp = os.path.join(root, f)
+                        if not any(x['path'] == fp for x in self.queue_items):
+                            self.queue_items.append({'path': fp, 'name': GameAnalyzer.clean_display_title(f)[:32], 'size': format_size(os.path.getsize(fp))})
             self.refresh_queue_view()
 
     def clear_queue(self):
+        sound_fx.play_click()
         self.queue_items.clear()
         self.refresh_queue_view()
 
-    def refresh(self):
-        drives = UsbDetector.get_removable_drives()
-        vals = [f"{d['mountpoint']} [{d['fstype']}] - {d['device']}" for d in drives]
-        if not vals: vals = [t("inst_err_nodrive")]
-        self.cmb_drive.configure(values=vals)
-        if self.var_drive.get() not in vals and vals:
-            self.var_drive.set(vals[0])
-
     def refresh_queue_view(self):
-        for w in self.list_box.winfo_children(): w.destroy()
+        for w in self.batch_list.winfo_children():
+            w.destroy()
         if not self.queue_items:
-            ctk.CTkLabel(self.list_box, text=t("batch_empty"), text_color=cfg.get_color("text_muted")).pack(pady=40)
+            ctk.CTkLabel(self.batch_list, text=t("batch_empty"), text_color=cfg.get_color("text_muted")).pack(pady=35)
             return
         for idx, item in enumerate(self.queue_items):
-            row = ctk.CTkFrame(self.list_box, fg_color=cfg.get_color("bg_main"), height=36)
-            row.pack(fill="x", pady=2, padx=4); row.pack_propagate(False)
-            ctk.CTkLabel(row, text=f"{idx+1}. {item['name']}", font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("text_main")).pack(side="left", padx=10)
-            ctk.CTkLabel(row, text=item['size'], font=("Consolas", 10), text_color=cfg.get_color("text_muted")).pack(side="left", padx=10)
-            ctk.CTkButton(row, text="X", width=28, height=24, fg_color=cfg.get_color("danger"), corner_radius=4, command=lambda i=idx: self.remove_item(i)).pack(side="right", padx=10)
-
-    def remove_item(self, idx):
-        if 0 <= idx < len(self.queue_items):
-            self.queue_items.pop(idx)
-            self.refresh_queue_view()
+            row = ctk.CTkFrame(self.batch_list, fg_color=cfg.get_color("bg_main"), height=38, corner_radius=cfg.get_radius("chip"))
+            row.pack(fill="x", pady=2, padx=4)
+            row.pack_propagate(False)
+            ctk.CTkLabel(row, text=f"{idx+1}. {item['name']}", font=("Segoe UI", 11, "bold")).pack(side="left", padx=12)
+            ctk.CTkLabel(row, text=item['size'], font=("Consolas", 10), text_color=cfg.get_color("text_muted")).pack(side="left", padx=8)
+            ctk.CTkButton(row, text="✕", width=28, height=24, fg_color=cfg.get_color("danger"), corner_radius=cfg.get_radius("button"), command=lambda i=idx: [sound_fx.play_click(), self.queue_items.pop(i), self.refresh_queue_view()]).pack(side="right", padx=10)
 
     def start_batch(self):
+        sound_fx.play_click()
         if not self.queue_items:
             messagebox.showwarning(t("warning"), t("batch_warn_empty"))
             return
-        drv_str = self.var_drive.get()
-        if drv_str == t("inst_err_nodrive"):
-            messagebox.showerror(t("error"), t("batch_err_nodrive"))
-            return
-        mp = drv_str.split(" ")[0]
-        drives = UsbDetector.get_removable_drives()
-        target_d = next((d for d in drives if d['mountpoint'].upper() == mp.upper() or d['device'].upper() == mp.upper()), None)
+        target_d = self._resolve_drive(self.var_b_drv.get())
         if not target_d:
             messagebox.showerror(t("error"), t("batch_err_nodrive"))
             return
+        self.btn_batch.configure(state="disabled")
+        self.prog_b_total.set(0)
+        self.prog_b_item.set(0)
 
-        self.btn_start.configure(state="disabled")
-        self.prog_total.set(0); self.prog_item.set(0)
-
-        def on_done(success):
-            self.app.after(0, lambda: [
-                self.btn_start.configure(state="normal"),
-                self.prog_total.set(1.0), self.prog_item.set(1.0),
+        self.batch_worker = BatchInstallWorker(
+            self.queue_items.copy(), target_d, self.var_b_art.get(),
+            cb_item_prog=lambda v: self.app.after(0, lambda: self.prog_b_item.set(v)),
+            cb_total_prog=lambda v: self.app.after(0, lambda: self.prog_b_total.set(v)),
+            cb_log=lambda m: sys_logger.log(m, "BATCH"),
+            cb_done=lambda _: self.app.after(0, lambda: [
+                self.btn_batch.configure(state="normal"),
                 sound_fx.play_success(),
                 messagebox.showinfo(t("batch_done_title"), t("batch_done_msg")),
                 self.clear_queue()
             ])
-
-        self.worker = BatchInstallWorker(
-            self.queue_items.copy(), target_d, self.var_art.get(),
-            cb_item_prog=lambda v: self.app.after(0, lambda: self.prog_item.set(v)),
-            cb_total_prog=lambda v: self.app.after(0, lambda: self.prog_total.set(v)),
-            cb_log=lambda m: sys_logger.log(m, "BATCH"),
-            cb_done=on_done
         )
-        self.worker.start()
+        self.batch_worker.start()
 
-class DvdBurnerPage(ctk.CTkFrame):
-    """Aba para gravação física de DVDs com velocidade e barra de progresso (sem simulações falsas)."""
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app = app
-        self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self, text=t("burn_title"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-
-        frm = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), border_width=1, border_color=cfg.get_color("border"), corner_radius=cfg.get_radius("card"))
-        frm.grid(row=1, column=0, sticky="nsew")
-
-        ctk.CTkLabel(frm, text=t("burn_iso"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
-        f_iso = ctk.CTkFrame(frm, fg_color="transparent")
-        f_iso.pack(fill="x", padx=20)
-        self.ent_iso = ctk.CTkEntry(f_iso, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry"))
-        self.ent_iso.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f_iso, text=t("btn_select"), width=90, corner_radius=cfg.get_radius("button"), command=self.browse).pack(side="left", padx=10)
-
-        ctk.CTkLabel(frm, text=t("burn_drv"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        self.var_drv = ctk.StringVar(value=t("burn_no_drives"))
-        self.cmb_drv = ctk.CTkOptionMenu(frm, variable=self.var_drv, values=[t("burn_no_drives")], height=32, corner_radius=cfg.get_radius("entry"))
-        self.cmb_drv.pack(fill="x", padx=20)
-
-        ctk.CTkLabel(frm, text=t("burn_spd"), font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        self.var_spd = ctk.StringVar(value="4x (OPL/PS2)")
-        self.cmb_spd = ctk.CTkOptionMenu(frm, variable=self.var_spd, values=["1x", "2x", "4x (OPL/PS2)", "8x", "16x", "MAX"], height=32, corner_radius=cfg.get_radius("entry"))
-        self.cmb_spd.pack(fill="x", padx=20)
-
-        self.btn_burn = ctk.CTkButton(frm, text=t("burn_btn"), font=("Segoe UI", 13, "bold"), height=42, fg_color=cfg.get_color("danger"), corner_radius=cfg.get_radius("button"), command=self.start_burn)
-        self.btn_burn.pack(pady=20, padx=20, fill="x")
-
-        self.lbl_status = ctk.CTkLabel(frm, text=t("burn_ready"), font=("Segoe UI", 11), text_color=cfg.get_color("text_muted"))
-        self.lbl_status.pack(pady=(0, 5))
-
-        self.prog = ctk.CTkProgressBar(frm, progress_color=cfg.get_color("accent"))
-        self.prog.pack(fill="x", padx=20, pady=(0, 20))
-        self.prog.set(0)
-
-    def browse(self):
-        f = filedialog.askopenfilename(filetypes=[(t("iso_files"), "*.iso")])
-        if f:
-            self.ent_iso.delete(0, 'end')
-            self.ent_iso.insert(0, f)
-
-    def refresh(self):
-        burners = DvdBurnerWorker.list_burners()
-        vals = [b['name'] for b in burners] if burners else [t("burn_no_drives")]
-        self.cmb_drv.configure(values=vals)
-        if self.var_drv.get() not in vals and vals:
-            self.var_drv.set(vals[0])
-
-    def start_burn(self):
-        iso = self.ent_iso.get().strip()
-        if not iso or not os.path.exists(iso):
-            messagebox.showerror(t("error"), t("burn_err_select_iso"))
-            return
-
-        drv_name = self.var_drv.get()
-        if drv_name == t("burn_no_drives"):
-            messagebox.showerror(t("error"), t("burn_err_nomedia"))
-            return
-
-        burners = DvdBurnerWorker.list_burners()
-        target_b = next((b for b in burners if b['name'] == drv_name), None)
-        target_id = target_b['id'] if target_b else drv_name
-
-        self.btn_burn.configure(state="disabled")
-        self.prog.set(0)
-        self.lbl_status.configure(text=t("burn_progress_msg"))
-
-        def on_done(s):
-            self.app.after(0, lambda: [
-                self.btn_burn.configure(state="normal"),
-                self.prog.set(1.0),
-                self.lbl_status.configure(text=t("burn_done")),
-                sound_fx.play_success(),
-                messagebox.showinfo(t("success"), t("burn_done"))
-            ])
-
-        def on_err(e):
-            self.app.after(0, lambda: [
-                self.btn_burn.configure(state="normal"),
-                self.lbl_status.configure(text=f"{t('error')}: {e}"),
-                sound_fx.play_error(),
-                messagebox.showerror(t("burn_err_title"), str(e))
-            ])
-
-        def on_prog(v):
-            self.app.after(0, lambda: [
-                self.prog.set(v),
-                self.lbl_status.configure(text=f"{t('burn_writing_sectors')} {int(v*100)}%")
-            ])
-
-        DvdBurnerWorker.burn(iso, target_id, self.var_spd.get(), on_prog, on_done, on_err)
-
-class EmulatorTestPage(ctk.CTkFrame):
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app = app
-        self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self, text=t("tab_emu"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-
-        card = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-
-        ctk.CTkLabel(card, text="Quick Play Test (PCSX2):", font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(anchor="w", padx=20, pady=(20, 5))
-        self.var_game = ctk.StringVar(value="Select Game...")
-        self.cmb_game = ctk.CTkOptionMenu(card, variable=self.var_game, values=["Select Game..."], height=32, corner_radius=cfg.get_radius("entry"))
-        self.cmb_game.pack(fill="x", padx=20, pady=5)
-
-        ctk.CTkButton(
-            card, text=t("lib_btn_test"), font=("Segoe UI", 12, "bold"),
-            fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"),
-            command=self.run_test
-        ).pack(fill="x", padx=20, pady=20)
-
-    def refresh(self):
-        games = self.app.library.games
-        vals = [g['name'] for g in games] or ["No games in library"]
-        self.cmb_game.configure(values=vals)
-        if self.var_game.get() not in vals and vals:
-            self.var_game.set(vals[0])
-
-    def run_test(self):
-        sel = self.var_game.get()
-        g = next((x for x in self.app.library.games if x['name'] == sel), None)
-        if g:
-            PCSX2Integration.test_iso(g['path'], lambda e: messagebox.showerror(t("error"), e))
-
-class AppsManagerPage(ctk.CTkFrame):
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app = app
-        self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self, text=t("tab_apps"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-
-        card = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-
-        ctk.CTkLabel(card, text=t("app_name"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
-        self.ent_title = ctk.CTkEntry(card, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry"))
-        self.ent_title.pack(fill="x", padx=20)
-
-        ctk.CTkLabel(card, text=t("app_elf"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        btn_frm = ctk.CTkFrame(card, fg_color="transparent")
-        btn_frm.pack(fill="x", padx=20)
-        self.ent_elf = ctk.CTkEntry(btn_frm, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry"))
-        self.ent_elf.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(btn_frm, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=self.browse).pack(side="left", padx=10)
-
-        ctk.CTkLabel(card, text=t("app_drv"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        self.var_drive = ctk.StringVar(value="Select USB...")
-        self.cmb_drive = ctk.CTkOptionMenu(card, variable=self.var_drive, values=["Select USB..."], height=32, corner_radius=cfg.get_radius("entry"))
-        self.cmb_drive.pack(fill="x", padx=20)
-
-        ctk.CTkButton(
-            card, text=t("app_btn"), font=("Segoe UI", 12, "bold"),
-            fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"),
-            command=self.install
-        ).pack(fill="x", padx=20, pady=25)
-
-    def browse(self):
-        f = filedialog.askopenfilename(filetypes=[("ELF Executables", "*.elf")])
-        if f:
-            self.ent_elf.delete(0, 'end')
-            self.ent_elf.insert(0, f)
-            if not self.ent_title.get():
-                self.ent_title.insert(0, os.path.splitext(os.path.basename(f))[0])
-
-    def refresh(self):
-        drives = UsbDetector.get_removable_drives()
-        vals = [d['mountpoint'] for d in drives] or ["No USB connected"]
-        self.cmb_drive.configure(values=vals)
-        if self.var_drive.get() not in vals and vals:
-            self.var_drive.set(vals[0])
-
-    def install(self):
-        res = AppManager.install_elf(self.cmb_drive.get(), self.ent_title.get(), self.ent_elf.get())
-        if res is True:
-            sound_fx.play_success()
-            messagebox.showinfo(t("success"), t("app_succ"))
-        else:
+    def run_split(self):
+        sound_fx.play_click()
+        s, d = self.ent_u_iso.get().strip(), self.ent_u_dst.get().strip()
+        if not s or not d:
             sound_fx.play_error()
-            messagebox.showerror(t("error"), res)
-
-class IsoExtractorPage(ctk.CTkFrame):
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app = app
-        self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self, text=t("tab_iso"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-
-        card = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-
-        ctk.CTkLabel(card, text="Source ISO Image:", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
-        src_frm = ctk.CTkFrame(card, fg_color="transparent")
-        src_frm.pack(fill="x", padx=20)
-        self.ent_src = ctk.CTkEntry(src_frm, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry"))
-        self.ent_src.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(src_frm, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=self.browse_src).pack(side="left", padx=10)
-
-        ctk.CTkLabel(card, text="Output Directory:", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        dst_frm = ctk.CTkFrame(card, fg_color="transparent")
-        dst_frm.pack(fill="x", padx=20)
-        self.ent_dst = ctk.CTkEntry(dst_frm, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry"))
-        self.ent_dst.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(dst_frm, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=self.browse_dst).pack(side="left", padx=10)
-
-        self.btn_ext = ctk.CTkButton(
-            card, text="EXTRACT ISO CONTENTS", font=("Segoe UI", 12, "bold"),
-            fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"),
-            command=self.extract
-        )
-        self.btn_ext.pack(fill="x", padx=20, pady=20)
-
-        self.prog = ctk.CTkProgressBar(card, progress_color=cfg.get_color("highlight"))
-        self.prog.pack(fill="x", padx=20, pady=(0, 20))
-        self.prog.set(0)
-
-    def browse_src(self):
-        f = filedialog.askopenfilename(filetypes=[(t("iso_files"), "*.iso")])
-        if f:
-            self.ent_src.delete(0, 'end')
-            self.ent_src.insert(0, f)
-
-    def browse_dst(self):
-        p = filedialog.askdirectory()
-        if p:
-            self.ent_dst.delete(0, 'end')
-            self.ent_dst.insert(0, p)
-
-    def extract(self):
-        s, d = self.ent_src.get(), self.ent_dst.get()
-        if not s or not d: return
-        self.btn_ext.configure(state="disabled")
-        RealIsoTool.extract(
-            s, d,
-            lambda v: self.app.after(0, lambda: self.prog.set(v)),
-            lambda succ: self.app.after(0, lambda: [self.btn_ext.configure(state="normal"), sound_fx.play_success(), messagebox.showinfo(t("success"), "Extraction finished!")]),
-            lambda e: self.app.after(0, lambda: [self.btn_ext.configure(state="normal"), sound_fx.play_error(), messagebox.showerror(t("error"), e)])
-        )
-
-class USBPage(ctk.CTkFrame):
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app = app
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-
-        ctk.CTkLabel(self, text=t("tab_usb"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-        self.list_box = ctk.CTkScrollableFrame(self, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        self.list_box.grid(row=1, column=0, sticky="nsew")
-
-    def refresh(self):
-        for w in self.list_box.winfo_children(): w.destroy()
-        drives = UsbDetector.get_removable_drives()
-        if not drives:
-            ctk.CTkLabel(self.list_box, text=t("burn_no_drives"), text_color=cfg.get_color("text_muted")).pack(pady=40)
             return
-        for d in drives:
-            card = HoverCard(self.list_box, height=65, corner_radius=cfg.get_radius("chip"), fg_color=cfg.get_color("bg_main"))
-            card.pack(fill="x", pady=4, padx=4); card.pack_propagate(False)
-            ctk.CTkLabel(card, text=f"{d['mountpoint']} [{d['fstype']}]", font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("text_main")).pack(side="left", padx=15)
-            ctk.CTkLabel(card, text=f"{d['used']} / {d['total']} ({d['free']} free)", font=("Consolas", 10), text_color=cfg.get_color("text_muted")).pack(side="left", padx=10)
-            ctk.CTkButton(card, text=t("inst_btn"), height=28, corner_radius=cfg.get_radius("button"), fg_color=cfg.get_color("accent"), command=lambda: self.app.show("single_install")).pack(side="right", padx=15)
-            card.bind_children(card)
-
-class IsoPatcherPage(ctk.CTkFrame):
-    def __init__(self, master, app):
-        super().__init__(master, fg_color="transparent")
-        self.app = app
-        self.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self, text=t("tab_patcher"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-
-        card = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-
-        ctk.CTkLabel(card, text=t("patch_iso"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
-        f1 = ctk.CTkFrame(card, fg_color="transparent"); f1.pack(fill="x", padx=20)
-        self.ent_iso = ctk.CTkEntry(f1, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry")); self.ent_iso.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f1, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=lambda: self.browse(self.ent_iso, [(t("iso_files"), "*.iso")])).pack(side="left", padx=10)
-
-        ctk.CTkLabel(card, text=t("patch_file"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        f2 = ctk.CTkFrame(card, fg_color="transparent"); f2.pack(fill="x", padx=20)
-        self.ent_patch = ctk.CTkEntry(f2, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry")); self.ent_patch.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f2, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=lambda: self.browse(self.ent_patch, [("Patches", "*.ips")])).pack(side="left", padx=10)
-
-        ctk.CTkLabel(card, text=t("patch_out"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        f3 = ctk.CTkFrame(card, fg_color="transparent"); f3.pack(fill="x", padx=20)
-        self.ent_out = ctk.CTkEntry(f3, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry")); self.ent_out.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f3, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=lambda: self.browse(self.ent_out, [(t("iso_files"), "*.iso")], save=True)).pack(side="left", padx=10)
-
-        self.chk_region = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(card, text=t("patch_reg"), font=("Segoe UI", 11), variable=self.chk_region).pack(anchor="w", padx=20, pady=15)
-
-        self.btn = ctk.CTkButton(card, text=t("patch_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"), command=self.apply_patch)
-        self.btn.pack(pady=20, padx=20, fill="x")
-
-        self.prog = ctk.CTkProgressBar(card, progress_color=cfg.get_color("highlight")); self.prog.pack(fill="x", padx=20, pady=(0, 20)); self.prog.set(0)
-
-    def browse(self, entry, ftypes, save=False):
-        f = filedialog.asksaveasfilename(filetypes=ftypes) if save else filedialog.askopenfilename(filetypes=ftypes)
-        if f:
-            entry.delete(0, 'end'); entry.insert(0, f)
-
-    def apply_patch(self):
-        self.btn.configure(state="disabled")
-        TranslationPatcher.patch_iso(
-            self.ent_iso.get().strip(), self.ent_out.get().strip(), self.ent_patch.get().strip(), self.chk_region.get(),
-            lambda v: self.app.after(0, lambda: self.prog.set(v)),
-            lambda s: self.app.after(0, lambda: [self.btn.configure(state="normal"), sound_fx.play_success(), messagebox.showinfo(t("success"), t("patch_success"))]),
-            lambda e: self.app.after(0, lambda: [self.btn.configure(state="normal"), sound_fx.play_error(), messagebox.showerror(t("error"), e)])
+        self.btn_split.configure(state="disabled")
+        self.prog_u.set(0)
+        USBUtilWorker.split_and_generate(
+            s, d, self.ent_u_name.get().strip() or GameAnalyzer.clean_display_title(os.path.basename(s))[:32],
+            cb_prog=lambda v: self.app.after(0, lambda: self.prog_u.set(v)),
+            cb_done=lambda _: self.app.after(0, lambda: [self.btn_split.configure(state="normal"), sound_fx.play_success(), messagebox.showinfo(t("success"), t("util_succ"))]),
+            cb_err=lambda e: self.app.after(0, lambda: [self.btn_split.configure(state="normal"), sound_fx.play_error(), messagebox.showerror(t("error"), str(e))])
         )
 
+
+# ==============================================================================
+# CONFIGURAÇÕES (MODO BATATA FORTE, SOM DE ABA SEPARADO & VARIAÇÕES DE ANIMAÇÃO)
+# ==============================================================================
 class SettingsPage(ctk.CTkFrame):
     def __init__(self, master, app):
         super().__init__(master, fg_color="transparent")
         self.app = app
+        self._bg_commit_job = None
+        self._preview_photo = None
         self.grid_columnconfigure((0, 1), weight=1)
-        ctk.CTkLabel(self, text=t("tab_set"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 15))
+        self.grid_rowconfigure(1, weight=1)
 
-        frm_left = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        frm_left.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
+        PageHeader(self, t("tab_set"), t("set_sub")).grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14)
+        )
 
-        ctk.CTkLabel(frm_left, text=t("set_lang"), font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("accent")).pack(anchor="w", padx=15, pady=(15, 5))
+        frm_left = ctk.CTkScrollableFrame(
+            self, fg_color=cfg.get_color("card_base"),
+            corner_radius=cfg.get_radius("card"),
+            border_width=cfg.get_border_width(), border_color=cfg.get_color("border")
+        )
+        frm_left.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+
+        ctk.CTkLabel(frm_left, text=t("set_app"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("accent")).pack(anchor="w", padx=14, pady=(10, 8))
 
         LANG_MAP = {
             "PT_BR": "Português (Brasil) [PT_BR]",
@@ -1476,98 +595,342 @@ class SettingsPage(ctk.CTkFrame):
             "JA": "日本語 [JA]"
         }
         INV_LANG_MAP = {v: k for k, v in LANG_MAP.items()}
-
-        cur_lang_code = cfg.data.get("language", "PT_BR")
-        self.lang_var = ctk.StringVar(value=LANG_MAP.get(cur_lang_code, LANG_MAP["PT_BR"]))
+        self.lang_var = ctk.StringVar(value=LANG_MAP.get(cfg.data.get("language", "PT_BR"), LANG_MAP["PT_BR"]))
 
         def on_lang_change(val):
-            code = INV_LANG_MAP.get(val, "PT_BR")
-            cfg.data["language"] = code
+            sound_fx.play_click()
+            cfg.data["language"] = INV_LANG_MAP.get(val, "PT_BR")
             cfg.save()
-            self.app.after(50, self.app.refresh_all_ui)
+            self.app.after(40, self.app.refresh_all_ui)
 
-        ctk.CTkOptionMenu(
-            frm_left, variable=self.lang_var, values=list(LANG_MAP.values()), height=30,
-            command=on_lang_change, corner_radius=cfg.get_radius("entry")
-        ).pack(anchor="w", padx=15, pady=(0, 10))
+        ctk.CTkLabel(frm_left, text=t("set_lang"), font=("Segoe UI", 10, "bold"), text_color=cfg.get_color("text_muted")).pack(anchor="w", padx=18)
+        ctk.CTkOptionMenu(frm_left, variable=self.lang_var, values=list(LANG_MAP.values()), height=32, command=on_lang_change, corner_radius=cfg.get_radius("entry")).pack(fill="x", padx=18, pady=(2, 10))
 
-        ctk.CTkLabel(frm_left, text=t("set_theme"), font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("accent")).pack(anchor="w", padx=15, pady=(10, 5))
-        self.theme_var = ctk.StringVar(value=cfg.data.get("theme", "Dark"))
+        ctk.CTkLabel(frm_left, text=t("set_theme"), font=("Segoe UI", 10, "bold"), text_color=cfg.get_color("text_muted")).pack(anchor="w", padx=18)
+        self.theme_var = ctk.StringVar(value=cfg.data.get("theme", "Midnight Neon"))
         ctk.CTkOptionMenu(
-            frm_left, variable=self.theme_var, values=list(THEMES.keys()), height=30,
-            command=lambda c: [cfg.data.update({"theme": c}), cfg.save(), self.app.after(50, self.app.refresh_all_ui)],
+            frm_left, variable=self.theme_var, values=list(THEMES.keys()), height=32,
+            command=lambda c: [sound_fx.play_click(), cfg.data.update({"theme": c}), cfg.save(), self.app.after(40, self.app.refresh_all_ui)],
             corner_radius=cfg.get_radius("entry")
-        ).pack(anchor="w", padx=15, pady=(0, 15))
+        ).pack(fill="x", padx=18, pady=(2, 10))
 
-        ctk.CTkLabel(frm_left, text=t("set_beh"), font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("accent")).pack(anchor="w", padx=15, pady=(5, 5))
-        self.snd_var = ctk.BooleanVar(value=cfg.data.get("sound_enabled", True))
-        self.bgm_var = ctk.BooleanVar(value=cfg.data.get("bgm_enabled", True))
-        self.anim_var = ctk.BooleanVar(value=cfg.data.get("animations", True))
-        self.laptop_var = ctk.BooleanVar(value=cfg.data.get("laptop_mode", False))
+        ANIM_MAP = {
+            "Slide": t("anim_slide"),
+            "Rise": t("anim_rise"),
+            "Zoom": t("anim_zoom"),
+            "Step": t("anim_step")
+        }
+        INV_ANIM_MAP = {v: k for k, v in ANIM_MAP.items()}
+        self.anim_style_var = ctk.StringVar(value=ANIM_MAP.get(cfg.data.get("anim_style", "Slide"), ANIM_MAP["Slide"]))
 
-        def sv():
+        def on_anim_style(val):
+            sound_fx.play_click()
+            cfg.data["anim_style"] = INV_ANIM_MAP.get(val, "Slide")
+            cfg.save()
+
+        ctk.CTkLabel(frm_left, text=t("set_anim_style"), font=("Segoe UI", 10, "bold"), text_color=cfg.get_color("text_muted")).pack(anchor="w", padx=18)
+        ctk.CTkOptionMenu(
+            frm_left, variable=self.anim_style_var, values=list(ANIM_MAP.values()),
+            height=32, command=on_anim_style, corner_radius=cfg.get_radius("entry")
+        ).pack(fill="x", padx=18, pady=(2, 14))
+
+        ctk.CTkLabel(frm_left, text=t("set_beh"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("highlight")).pack(anchor="w", padx=18, pady=(4, 8))
+
+        self.snd_var = ctk.BooleanVar(value=bool(cfg.data.get("sound_enabled", True)))
+        self.tab_snd_var = ctk.BooleanVar(value=bool(cfg.data.get("tab_sound_enabled", True)))
+        self.bgm_var = ctk.BooleanVar(value=bool(cfg.data.get("bgm_enabled", True)))
+        self.anim_var = ctk.BooleanVar(value=bool(cfg.data.get("animations", True)))
+        self.potato_var = ctk.BooleanVar(value=bool(cfg.data.get("laptop_mode", False)))
+
+        def save_prefs(rebuild=False):
             cfg.data.update({
                 "sound_enabled": self.snd_var.get(),
+                "tab_sound_enabled": self.tab_snd_var.get(),
                 "bgm_enabled": self.bgm_var.get(),
                 "animations": self.anim_var.get(),
-                "laptop_mode": self.laptop_var.get()
+                "laptop_mode": self.potato_var.get()
             })
             cfg.save()
-            sound_fx.enabled = self.snd_var.get()
-            sound_fx.update_bgm(self.bgm_var.get())
+            sound_fx.sync_from_config()
+            if self.snd_var.get():
+                sound_fx.play_click()
+            if rebuild:
+                self.app.after(40, self.app.refresh_all_ui)
 
-        ctk.CTkSwitch(frm_left, text=t("set_snd"), font=("Segoe UI", 11), variable=self.snd_var, command=sv).pack(anchor="w", padx=15, pady=(0, 10))
-        ctk.CTkSwitch(frm_left, text=t("set_bgm"), font=("Segoe UI", 11), variable=self.bgm_var, command=sv).pack(anchor="w", padx=15, pady=(0, 10))
-        ctk.CTkSwitch(frm_left, text=t("set_anim"), font=("Segoe UI", 11), variable=self.anim_var, command=sv).pack(anchor="w", padx=15, pady=(0, 10))
+        ctk.CTkSwitch(frm_left, text=t("set_snd"), font=("Segoe UI", 11), variable=self.snd_var, command=save_prefs).pack(anchor="w", padx=18, pady=5)
+        ctk.CTkSwitch(frm_left, text=t("set_tab_snd"), font=("Segoe UI", 11), variable=self.tab_snd_var, command=save_prefs).pack(anchor="w", padx=18, pady=5)
+        ctk.CTkSwitch(frm_left, text=t("set_bgm"), font=("Segoe UI", 11), variable=self.bgm_var, command=save_prefs).pack(anchor="w", padx=18, pady=5)
+        ctk.CTkSwitch(frm_left, text=t("set_anim"), font=("Segoe UI", 11), variable=self.anim_var, command=save_prefs).pack(anchor="w", padx=18, pady=5)
+
+        potato_box = ctk.CTkFrame(frm_left, fg_color=cfg.get_color("bg_main"), corner_radius=cfg.get_radius("chip"))
+        potato_box.pack(fill="x", padx=18, pady=(8, 16))
         ctk.CTkSwitch(
-            frm_left, text=t("set_laptop"), font=("Segoe UI", 11, "bold"),
-            text_color=cfg.get_color("highlight"), variable=self.laptop_var,
-            command=lambda: [sv(), self.app.after(50, self.app.refresh_all_ui)]
-        ).pack(anchor="w", padx=15, pady=(0, 15))
+            potato_box, text=t("set_potato"), font=("Segoe UI", 11, "bold"),
+            text_color=cfg.get_color("warning"), progress_color=cfg.get_color("warning"),
+            variable=self.potato_var, command=lambda: save_prefs(rebuild=True)
+        ).pack(anchor="w", padx=12, pady=10)
 
-        frm_right = ctk.CTkFrame(self, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        frm_right.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
+        # Coluna Direita: Personalização do Fundo (Transparência & Borrão) + Sistema
+        frm_right = ctk.CTkScrollableFrame(
+            self, fg_color=cfg.get_color("card_base"),
+            corner_radius=cfg.get_radius("card"),
+            border_width=cfg.get_border_width(), border_color=cfg.get_color("border")
+        )
+        frm_right.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
 
-        ctk.CTkLabel(frm_right, text=t("dev_tools"), font=("Segoe UI", 11, "bold"), text_color=cfg.get_color("warning")).pack(anchor="w", padx=15, pady=(15, 10))
         r = cfg.get_radius("button")
+
+        # --- Seção: Personalizar o Fundo de Tudo + Transparência (0-100%) + Borrão (0-100%) ---
+        ctk.CTkLabel(
+            frm_right, text=t("set_bg_title"), font=("Segoe UI", 12, "bold"),
+            text_color=cfg.get_color("highlight")
+        ).pack(anchor="w", padx=14, pady=(10, 8))
+
+        bg_box = ctk.CTkFrame(
+            frm_right, fg_color=cfg.get_color("bg_main"),
+            corner_radius=cfg.get_radius("chip"),
+            border_width=cfg.get_border_width(), border_color=cfg.get_color("border")
+        )
+        bg_box.pack(fill="x", padx=14, pady=(0, 14))
+
+        self.bg_preview_lbl = tk.Label(bg_box, bg=cfg.get_color("bg_main"), height=3, bd=0, highlightthickness=0)
+        self.bg_preview_lbl.pack(fill="x", padx=10, pady=(10, 8))
+
+        bg_btns = ctk.CTkFrame(bg_box, fg_color="transparent")
+        bg_btns.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(
+            bg_btns, text=t("set_bg_img"), height=32, font=("Segoe UI", 10, "bold"),
+            fg_color=cfg.get_color("accent"), hover_color=cfg.get_hover("accent_hover", "accent"),
+            corner_radius=r, command=self.pick_bg_image
+        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(
+            bg_btns, text=t("set_bg_col"), height=32, font=("Segoe UI", 10, "bold"),
+            fg_color=cfg.get_color("chip_bg"), hover_color=cfg.get_hover("card_hover", "chip_bg"),
+            corner_radius=r, command=self.pick_bg_color
+        ).pack(side="left", expand=True, fill="x", padx=4)
+        ctk.CTkButton(
+            bg_btns, text=t("set_bg_reset"), width=82, height=32, font=("Segoe UI", 10, "bold"),
+            fg_color=cfg.get_color("danger"), corner_radius=r, command=self.reset_bg_custom
+        ).pack(side="left", padx=(4, 0))
+
+        cur_tr = max(0, min(100, int(cfg.data.get("bg_transparency", 0) or 0)))
+        cur_bl = max(0, min(100, int(cfg.data.get("bg_blur", 0) or 0)))
+
+        tr_hdr = ctk.CTkFrame(bg_box, fg_color="transparent")
+        tr_hdr.pack(fill="x", padx=12, pady=(2, 0))
+        ctk.CTkLabel(tr_hdr, text=t("set_bg_transp"), font=("Segoe UI", 10, "bold"), text_color=cfg.get_color("text_muted")).pack(side="left")
+        self.lbl_transp_val = ctk.CTkLabel(tr_hdr, text=f"{cur_tr}%", font=("Consolas", 11, "bold"), text_color=cfg.get_color("highlight"))
+        self.lbl_transp_val.pack(side="right")
+
+        self.sld_transp = ctk.CTkSlider(
+            bg_box, from_=0, to=100, number_of_steps=100,
+            progress_color=cfg.get_color("accent"), button_color=cfg.get_color("highlight"),
+            command=self._on_transp_slide
+        )
+        self.sld_transp.set(cur_tr)
+        self.sld_transp.pack(fill="x", padx=12, pady=(2, 8))
+
+        bl_hdr = ctk.CTkFrame(bg_box, fg_color="transparent")
+        bl_hdr.pack(fill="x", padx=12, pady=(2, 0))
+        ctk.CTkLabel(bl_hdr, text=t("set_bg_blur"), font=("Segoe UI", 10, "bold"), text_color=cfg.get_color("text_muted")).pack(side="left")
+        self.lbl_blur_val = ctk.CTkLabel(bl_hdr, text=f"{cur_bl}%", font=("Consolas", 11, "bold"), text_color=cfg.get_color("highlight"))
+        self.lbl_blur_val.pack(side="right")
+
+        self.sld_blur = ctk.CTkSlider(
+            bg_box, from_=0, to=100, number_of_steps=100,
+            progress_color=cfg.get_color("accent"), button_color=cfg.get_color("highlight"),
+            command=self._on_blur_slide
+        )
+        self.sld_blur.set(cur_bl)
+        self.sld_blur.pack(fill="x", padx=12, pady=(2, 12))
+        self._update_bg_preview()
+
+        # --- Seção: Sistema & Diagnóstico ---
+        ctk.CTkLabel(frm_right, text=t("dev_tools"), font=("Segoe UI", 12, "bold"), text_color=cfg.get_color("warning")).pack(anchor="w", padx=14, pady=(4, 10))
 
         ctk.CTkButton(
             frm_right, text=t("roadmap_btn"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("accent"), hover_color=cfg.get_color("accent_hover"),
-            height=36, corner_radius=r, command=lambda: ChangelogTimelineModal(self.app)
-        ).pack(fill="x", padx=15, pady=(0, 12))
+            fg_color=cfg.get_color("accent"), hover_color=cfg.get_hover("accent_hover", "accent"),
+            height=38, corner_radius=r, command=lambda: [sound_fx.play_click(), ChangelogTimelineModal(self.app)]
+        ).pack(fill="x", padx=14, pady=5)
 
-        # Restaura o link original do formulário de avaliação do PS2Manager
         ctk.CTkButton(
             frm_right, text=t("set_rate"), font=("Segoe UI", 11, "bold"),
-            fg_color="#D97706", hover_color="#B45309", height=36, corner_radius=r,
-            command=lambda: webbrowser.open("https://docs.google.com/forms/d/e/1FAIpQLSdV8WZMSQGHtGOnhsdI1mxxAwzIdifNLrkBN1adfvRR9vDkYQ/viewform?usp=publish-editor")
-        ).pack(fill="x", padx=15, pady=(0, 12))
+            fg_color="#D97706", hover_color="#B45309", height=38, corner_radius=r,
+            command=lambda: [sound_fx.play_click(), webbrowser.open("https://docs.google.com/forms/d/e/1FAIpQLSdV8WZMSQGHtGOnhsdI1mxxAwzIdifNLrkBN1adfvRR9vDkYQ/viewform?usp=publish-editor")]
+        ).pack(fill="x", padx=14, pady=5)
+
+        ctk.CTkButton(
+            frm_right, text=t("dev_apa_sim"), font=("Segoe UI", 11, "bold"),
+            fg_color=cfg.get_color("chip_bg"), hover_color=cfg.get_hover("card_hover", "chip_bg"),
+            height=36, corner_radius=r, command=self.make_apa_test
+        ).pack(fill="x", padx=14, pady=5)
 
         ctk.CTkButton(
             frm_right, text=t("set_log"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("card_hover"), height=36, corner_radius=r,
-            command=self.export_log
-        ).pack(fill="x", padx=15, pady=(0, 12))
+            fg_color=cfg.get_color("chip_bg"), hover_color=cfg.get_hover("card_hover", "chip_bg"),
+            height=36, corner_radius=r, command=self.export_log
+        ).pack(fill="x", padx=14, pady=5)
 
         ctk.CTkButton(
             frm_right, text=t("ver_btn"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("card_hover"), height=36, corner_radius=r,
-            command=lambda: VersionRollbackModal(self.app)
-        ).pack(fill="x", padx=15, pady=(0, 12))
+            fg_color=cfg.get_color("chip_bg"), hover_color=cfg.get_hover("card_hover", "chip_bg"),
+            height=36, corner_radius=r, command=lambda: [sound_fx.play_click(), VersionRollbackModal(self.app)]
+        ).pack(fill="x", padx=14, pady=(5, 12))
+
+    def _update_bg_preview(self):
+        try:
+            c_img = str(cfg.data.get("custom_bg_image", "") or "")
+            blur_v = int(cfg.data.get("bg_blur", 0) or 0)
+            transp_v = int(cfg.data.get("bg_transparency", 0) or 0)
+            if _BG_PIL_OK and c_img and os.path.exists(c_img):
+                with _BgPILImage.open(c_img) as im:
+                    prev = im.convert("RGB").resize((360, 52), _BG_RESAMPLE_BILINEAR)
+                if blur_v > 0:
+                    prev = prev.filter(_BgPILFilter.GaussianBlur(radius=blur_v * 0.16))
+                if transp_v > 0:
+                    prev = _BgPILEnhance.Brightness(prev).enhance(max(0.35, 1.0 - transp_v * 0.005))
+                self._preview_photo = _BgPILTk.PhotoImage(prev)
+                self.bg_preview_lbl.configure(image=self._preview_photo, height=52, bg=cfg.get_color("bg_main"))
+            else:
+                self._preview_photo = None
+                self.bg_preview_lbl.configure(image="", height=2, bg=cfg.get_color("bg_main"))
+        except Exception:
+            pass
+
+    def _schedule_bg_commit(self, rebuild=False):
+        if self._bg_commit_job:
+            try:
+                self.after_cancel(self._bg_commit_job)
+            except Exception:
+                pass
+
+        def _commit():
+            self._bg_commit_job = None
+            cfg.invalidate_palette()
+            cfg.save()
+            self.app.apply_window_effects(live_alpha_only=False)
+            self._update_bg_preview()
+            if rebuild:
+                self.app.refresh_all_ui()
+            else:
+                self.app.configure(fg_color=cfg.get_color("bg_main"))
+                if hasattr(self.app, "sb") and self.app.sb.winfo_exists():
+                    self.app.sb.configure(fg_color=cfg.get_color("bg_sidebar"), border_color=cfg.get_color("border"))
+
+        self._bg_commit_job = self.after(200, _commit)
+
+    def _on_transp_slide(self, val):
+        iv = max(0, min(100, int(round(float(val)))))
+        self.lbl_transp_val.configure(text=f"{iv}%")
+        cfg.data["bg_transparency"] = iv
+        cfg.invalidate_palette()
+        self.app.apply_window_effects(live_alpha_only=True)
+        self._schedule_bg_commit(rebuild=False)
+
+    def _on_blur_slide(self, val):
+        iv = max(0, min(100, int(round(float(val)))))
+        self.lbl_blur_val.configure(text=f"{iv}%")
+        cfg.data["bg_blur"] = iv
+        cfg.invalidate_palette()
+        self._update_bg_preview()
+        self._schedule_bg_commit(rebuild=False)
+
+    def pick_bg_image(self):
+        sound_fx.play_click()
+        fp = filedialog.askopenfilename(
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp")]
+        )
+        if not fp or not os.path.exists(fp):
+            return
+        ext = os.path.splitext(fp)[1].lower() or ".png"
+        dst = os.path.join(APP_DATA_DIR, f"custom_bg{ext}")
+        try:
+            shutil.copy2(fp, dst)
+            cfg.data["custom_bg_image"] = dst
+            cfg.data["custom_bg_color"] = ""
+            cfg.save()
+            sound_fx.play_success()
+            self.app.after(30, self.app.refresh_all_ui)
+        except Exception:
+            sound_fx.play_error()
+
+    def pick_bg_color(self):
+        sound_fx.play_click()
+        chosen = colorchooser.askcolor(color=cfg.get_color("bg_main"))
+        if chosen and chosen[1]:
+            cfg.data["custom_bg_color"] = chosen[1]
+            cfg.data["custom_bg_image"] = ""
+            cfg.save()
+            sound_fx.play_success()
+            self.app.after(30, self.app.refresh_all_ui)
+
+    def reset_bg_custom(self):
+        sound_fx.play_click()
+        cfg.data["custom_bg_color"] = ""
+        cfg.data["custom_bg_image"] = ""
+        cfg.data["bg_transparency"] = 0
+        cfg.data["bg_blur"] = 0
+        cfg.save()
+        self.app.apply_window_effects(live_alpha_only=False)
+        self.app.after(30, self.app.refresh_all_ui)
+
+    def make_apa_test(self):
+        sound_fx.play_click()
+        p = APAManager.create_fake_vhd()
+        if p:
+            sound_fx.play_success()
+            messagebox.showinfo(t("success"), f"Created APA image:\n{p}")
 
     def export_log(self):
+        sound_fx.play_click()
         p = sys_logger.export()
         if p:
             sound_fx.play_success()
             messagebox.showinfo(t("success"), f"{t('set_log')}:\n{p}")
 
+
+class _LazyPageMap(dict):
+    """Constroi cada aba apenas no primeiro acesso, reduzindo o tempo de abertura e troca de tema em ~10x."""
+    def __init__(self, factories: dict, aliases: dict = None):
+        super().__init__()
+        self._factories = dict(factories)
+        self._aliases = dict(aliases or {})
+
+    def _resolve_key(self, key):
+        return self._aliases.get(key, key)
+
+    def __contains__(self, key):
+        rk = self._resolve_key(key)
+        return super().__contains__(rk) or (rk in self._factories)
+
+    def __getitem__(self, key):
+        rk = self._resolve_key(key)
+        if not super().__contains__(rk):
+            if rk not in self._factories:
+                raise KeyError(key)
+            super().__setitem__(rk, self._factories[rk]())
+        return super().__getitem__(rk)
+
+    def get(self, key, default=None):
+        rk = self._resolve_key(key)
+        if rk in self._factories or super().__contains__(rk):
+            return self[rk]
+        return default
+
+    def instantiated(self):
+        return list(super().values())
+
+
+# ==============================================================================
+# APLICAÇÃO PRINCIPAL COM MOTOR DE ANIMAÇÃO MULTI-ESTILO 60 FPS & FUNDO VIVO
+# ==============================================================================
 class MainApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
-        self.geometry("980x680")
-        self.minsize(850, 580)
+        self.title(f"{APP_NAME} — {APP_VERSION}")
+        self.geometry("1080x720")
+        self.minsize(920, 620)
         self.configure(fg_color=cfg.get_color("bg_main"))
 
         apply_window_icon(self)
@@ -1575,40 +938,113 @@ class MainApp(ctk.CTk):
 
         self.library = LibraryManager()
         self.cur = None
+        self.cur_key = None
         self.last_usb = -1
         self.active_transfers = 0
-        self.is_animating = False
-        self._last_click_time = 0
+        self._anim_job = None
+        self._usb_job = None
+        self._usb_probing = False
+        self.setup_frame = None
+        self._news_checked = False
+        self._news_overlay = None
+        self._bg_wall_lbl = None
+        self._bg_wall_photo = None
+        self._bg_wall_sig = None
 
-        self.bind_all("<Button-1>", self._on_global_click)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.bind("<Configure>", self._on_root_configure)
 
         if not cfg.data.get("setup_done", False):
             self.setup_frame = SetupFrame(self, self)
+            self.after(60, lambda: self.apply_window_effects(live_alpha_only=False))
         else:
             self.build_main_ui()
+            self.after(60, lambda: self.apply_window_effects(live_alpha_only=False))
             self.after(500, self.check_interrupted_transfer)
+            self.after(600, self.check_remote_news)
 
-    def _on_global_click(self, event):
-        now = time.time()
-        if now - self._last_click_time < 0.15:
-            return "break"
-        self._last_click_time = now
-        w = event.widget
-        is_sidebar = False
-        while w:
-            if hasattr(self, 'sb') and self.sb and str(w) == str(self.sb):
-                is_sidebar = True
-                break
-            w = w.master
-        if not is_sidebar:
-            sound_fx.play_click()
+    def apply_window_effects(self, live_alpha_only=False):
+        """Aplica transparencia global (0% a 100%) e borrao (0% a 100%) em toda a janela e fundo."""
+        try:
+            transp = max(0, min(100, int(cfg.data.get("bg_transparency", 0) or 0)))
+            alpha = 1.0 if transp <= 0 else round(1.0 - (transp / 100.0) * 0.88, 3)
+            self.attributes("-alpha", alpha)
+        except Exception:
+            pass
+
+        if live_alpha_only:
+            return
+
+        if sys.platform == "win32":
+            try:
+                hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
+                is_dark = ctypes.c_int(0 if cfg.data.get("theme") == "Light" else 1)
+                for attr_id in (20, 19):
+                    try:
+                        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr_id, ctypes.byref(is_dark), 4)
+                    except Exception:
+                        pass
+                blur_pct = max(0, min(100, int(cfg.data.get("bg_blur", 0) or 0)))
+                backdrop_type = ctypes.c_int(1 if blur_pct <= 0 else (2 if blur_pct < 50 else 3))
+                try:
+                    ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 38, ctypes.byref(backdrop_type), 4)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        self._render_custom_wallpaper()
+
+    def _render_custom_wallpaper(self):
+        c_img = str(cfg.data.get("custom_bg_image", "") or "").strip()
+        if not (_BG_PIL_OK and c_img and os.path.exists(c_img)):
+            if self._bg_wall_lbl is not None and self._bg_wall_lbl.winfo_exists():
+                self._bg_wall_lbl.place_forget()
+            self._bg_wall_sig = None
+            return
+
+        w = max(320, self.winfo_width())
+        h = max(240, self.winfo_height())
+        blur_pct = max(0, min(100, int(cfg.data.get("bg_blur", 0) or 0)))
+        sig = (c_img, w // 16, h // 16, blur_pct)
+        if sig == self._bg_wall_sig:
+            return
+        try:
+            with _BgPILImage.open(c_img) as im:
+                wall = im.convert("RGB").resize((w, h), _BG_RESAMPLE_BILINEAR)
+            if blur_pct > 0:
+                wall = wall.filter(_BgPILFilter.GaussianBlur(radius=blur_pct * 0.32))
+            wall = _BgPILEnhance.Brightness(wall).enhance(0.55)
+            self._bg_wall_photo = _BgPILTk.PhotoImage(wall)
+            if self._bg_wall_lbl is None or not self._bg_wall_lbl.winfo_exists():
+                self._bg_wall_lbl = tk.Label(self, bd=0, highlightthickness=0, bg=cfg.get_color("bg_main"))
+            self._bg_wall_lbl.configure(image=self._bg_wall_photo)
+            self._bg_wall_lbl.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+            self._bg_wall_lbl.lower()
+            self._bg_wall_sig = sig
+        except Exception:
+            pass
+
+    def _on_root_configure(self, event):
+        if event.widget is self and cfg.data.get("custom_bg_image"):
+            self._render_custom_wallpaper()
 
     def build_main_ui(self):
-        old_cur_key = next((k for k, v in getattr(self, 'pages', {}).items() if v == self.cur), None)
+        old_cur_key = self.cur_key
+        if self._anim_job:
+            try:
+                self.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+
         if hasattr(self, 'pages'):
-            for p in self.pages.values():
-                p.destroy()
+            existing = self.pages.instantiated() if hasattr(self.pages, "instantiated") else list(set(self.pages.values()))
+            for p in existing:
+                try:
+                    p.destroy()
+                except Exception:
+                    pass
         if hasattr(self, 'setup_frame') and self.setup_frame:
             self.setup_frame.destroy()
             self.setup_frame = None
@@ -1617,32 +1053,52 @@ class MainApp(ctk.CTk):
         if hasattr(self, 'content'):
             self.content.destroy()
 
+        sound_fx.sync_from_config()
+        self.configure(fg_color=cfg.get_color("bg_main"))
+        self.apply_window_effects(live_alpha_only=False)
+
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
-        self.sb = ctk.CTkFrame(self, width=230, corner_radius=0, fg_color=cfg.get_color("bg_sidebar"))
+        self.sb = ctk.CTkFrame(
+            self, width=245, corner_radius=0,
+            fg_color=cfg.get_color("bg_sidebar"),
+            border_width=cfg.get_border_width(), border_color=cfg.get_color("border")
+        )
         self.sb.grid(row=0, column=0, sticky="nsew")
-        self.sb.grid_rowconfigure(25, weight=1)
+        self.sb.grid_propagate(False)
+        self.sb.grid_columnconfigure(0, weight=1)
+        self.sb.grid_rowconfigure(24, weight=1)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent")
-        self.content.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
+        self.content.grid(row=0, column=1, sticky="nsew", padx=24, pady=20)
         self.content.grid_rowconfigure(0, weight=1)
         self.content.grid_columnconfigure(0, weight=1)
 
-        self.btns, self.nav_main, self.nav_more, self.cur = {}, [], [], None
+        self.btns, self.nav_main, self.nav_more, self.cur, self.cur_key = {}, [], [], None, None
 
+        # Brand Header
         brand = ctk.CTkFrame(self.sb, fg_color="transparent")
-        brand.grid(row=0, column=0, pady=(18, 12), padx=16, sticky="w")
-        ctk.CTkLabel(brand, text="PS2", font=("Segoe UI Black", 22), text_color=cfg.get_color("accent")).pack(side="left")
-        ctk.CTkLabel(brand, text="MANAGER", font=("Segoe UI Black", 14), text_color=cfg.get_color("text_main")).pack(side="left", padx=(4, 6))
-        ctk.CTkLabel(brand, text=APP_VERSION, font=("Consolas", 10, "bold"), text_color=cfg.get_color("highlight")).pack(side="left")
+        brand.grid(row=0, column=0, pady=(18, 10), padx=18, sticky="ew")
+        ctk.CTkLabel(brand, text="PS2", font=("Segoe UI Black", 24), text_color=cfg.get_color("accent")).pack(side="left")
+        ctk.CTkLabel(brand, text="MANAGER", font=("Segoe UI Black", 15), text_color=cfg.get_color("text_main")).pack(side="left", padx=(4, 8))
+        v_pill = ctk.CTkFrame(brand, fg_color=cfg.get_color("chip_bg"), corner_radius=cfg.get_radius("chip"))
+        v_pill.pack(side="left")
+        ctk.CTkLabel(v_pill, text=APP_VERSION, font=("Consolas", 10, "bold"), text_color=cfg.get_color("highlight")).pack(padx=7, pady=1)
+
+        self.lbl_sec = ctk.CTkLabel(
+            self.sb, text=t("nav_sec_main"), font=("Segoe UI", 9, "bold"),
+            text_color=cfg.get_color("text_muted")
+        )
+        self.lbl_sec.grid(row=1, column=0, padx=20, pady=(2, 4), sticky="w")
 
         def nav(row, k, txt, group="main"):
             b = ctk.CTkButton(
-                self.sb, text=txt, font=("Segoe UI", 11, "bold"),
+                self.sb, text=f"  {txt}", font=("Segoe UI", 11, "bold"),
                 fg_color="transparent", text_color=cfg.get_color("text_muted"),
-                anchor="w", height=34, corner_radius=cfg.get_radius("button"),
-                hover_color=cfg.get_color("card_hover"), command=lambda: self.show(k)
+                anchor="w", height=35, corner_radius=cfg.get_radius("button"),
+                hover_color=cfg.get_hover("card_hover", "bg_sidebar"),
+                command=lambda key=k: self.show(key)
             )
             if group == "main":
                 b.grid(row=row, column=0, padx=12, pady=2, sticky="ew")
@@ -1651,320 +1107,440 @@ class MainApp(ctk.CTk):
                 self.nav_more.append(k)
             self.btns[k] = b
 
-        nav(1, "dash", t("tab_dash"))
-        nav(2, "games", t("tab_lib"))
-        nav(3, "single_install", t("tab_install"))
-        nav(4, "batch", t("tab_batch"))
-        nav(5, "burn", t("tab_burn"))
-        nav(6, "test", t("tab_emu"))
-        nav(7, "usb", t("tab_usb"))
-        nav(8, "apps", t("tab_apps"))
+        # Navegação Principal (8 abas limpas e intuitivas)
+        nav(2, "dash", t("tab_dash"))
+        nav(3, "games", t("tab_lib"))
+        nav(4, "install", t("tab_install"))
+        nav(5, "usb", t("tab_usb"))
+        nav(6, "opl_cfg", t("tab_opl_cfg"))
+        nav(7, "art", t("tab_art"))
+        nav(8, "mc", t("tab_mc"))
+        nav(9, "test", t("tab_emu"))
 
         self.btn_enter_more = ctk.CTkButton(
-            self.sb, text=t("tab_more"), font=("Segoe UI", 11, "bold"),
-            fg_color="transparent", text_color=cfg.get_color("highlight"),
-            anchor="w", height=34, corner_radius=cfg.get_radius("button"),
-            hover_color=cfg.get_color("card_hover"), command=self.enter_more_tools
+            self.sb, text=f"  {t('tab_more')}", font=("Segoe UI", 11, "bold"),
+            fg_color=cfg.get_color("chip_bg"), text_color=cfg.get_color("highlight"),
+            anchor="w", height=36, corner_radius=cfg.get_radius("button"),
+            hover_color=cfg.get_hover("card_hover", "chip_bg"), command=self.enter_more_tools
         )
-        self.btn_enter_more.grid(row=9, column=0, padx=12, pady=4, sticky="ew")
+        self.btn_enter_more.grid(row=10, column=0, padx=12, pady=(8, 4), sticky="ew")
 
         self.btn_back_more = ctk.CTkButton(
             self.sb, text=t("btn_back"), font=("Segoe UI", 11, "bold"),
-            fg_color=cfg.get_color("card_base"), hover_color=cfg.get_color("card_hover"),
-            text_color=cfg.get_color("text_main"), anchor="w", height=38,
+            fg_color=cfg.get_color("card_base"), hover_color=cfg.get_hover("card_hover", "card_base"),
+            text_color=cfg.get_color("highlight"), anchor="w", height=36,
             corner_radius=cfg.get_radius("button"), command=self.exit_more_tools
         )
 
-        nav(2, "iso", t("tab_iso"), group="more")
-        nav(3, "patcher", t("tab_patcher"), group="more")
-        nav(4, "util", t("tab_util"), group="more")
-        nav(5, "rip", t("tab_rip"), group="more")
-        nav(6, "disc", t("tab_disc"), group="more")
-        nav(7, "clone", t("sub_clone")[2:], group="more")
-        nav(8, "migrate", t("tab_mig"), group="more")
+        # Ferramentas Avançadas (9 abas organizadas)
+        nav(3, "iso", t("tab_iso"), group="more")
+        nav(4, "patcher", t("tab_patcher"), group="more")
+        nav(5, "pops", t("tab_pops"), group="more")
+        nav(6, "burn", t("tab_burn"), group="more")
+        nav(7, "rip_disc", t("tab_rip"), group="more")
+        nav(8, "disk_ops", t("tab_mig"), group="more")
         nav(9, "cheats", t("tab_cht"), group="more")
-        nav(10, "apa", t("apa_title"), group="more")
-        nav(11, "art", t("art_title"), group="more")
+        nav(10, "apps", t("tab_apps"), group="more")
+        nav(11, "apa", t("apa_title"), group="more")
+
+        # Badge de Modo Batata se ativo
+        if cfg.is_potato():
+            p_badge = ctk.CTkFrame(self.sb, fg_color=cfg.get_color("card_base"), corner_radius=0)
+            p_badge.grid(row=25, column=0, padx=12, pady=(0, 6), sticky="ew")
+            ctk.CTkLabel(
+                p_badge, text=t("set_potato_badge"), font=("Consolas", 10, "bold"),
+                text_color=cfg.get_color("warning")
+            ).pack(pady=4)
 
         self.btns["settings"] = ctk.CTkButton(
-            self.sb, text=t("tab_set"), font=("Segoe UI", 11, "bold"),
+            self.sb, text=f"  ⚙  {t('tab_set')}", font=("Segoe UI", 11, "bold"),
             fg_color="transparent", text_color=cfg.get_color("text_muted"),
-            anchor="w", height=34, corner_radius=cfg.get_radius("button"),
-            hover_color=cfg.get_color("card_hover"), command=lambda: self.show("settings")
+            anchor="w", height=36, corner_radius=cfg.get_radius("button"),
+            hover_color=cfg.get_hover("card_hover", "bg_sidebar"),
+            command=lambda: self.show("settings")
         )
-        self.btns["settings"].grid(row=26, column=0, padx=12, pady=(0, 16), sticky="sew")
+        self.btns["settings"].grid(row=26, column=0, padx=12, pady=(0, 14), sticky="sew")
 
-        self.pages = {
-            "dash": DashboardPage(self.content, self),
-            "games": GamesPage(self.content, self),
-            "single_install": SingleInstallPage(self.content, self),
-            "batch": BatchInstallPage(self.content, self),
-            "burn": DvdBurnerPage(self.content, self),
-            "test": EmulatorTestPage(self.content, self),
-            "usb": USBPage(self.content, self),
-            "apps": AppsManagerPage(self.content, self),
-            "iso": IsoExtractorPage(self.content, self),
-            "patcher": IsoPatcherPage(self.content, self),
-            "util": self._build_util_page(),
-            "rip": self._build_rip_page(),
-            "disc": self._build_disc_page(),
-            "clone": self._build_clone_page(),
-            "migrate": self._build_migrate_page(),
-            "cheats": CheatManagerPage(self.content, self),
-            "apa": self._build_apa_page(),
-            "art": self._build_art_page(),
-            "settings": SettingsPage(self.content, self)
-        }
+        self.pages = _LazyPageMap(
+            {
+                "dash": lambda: DashboardPage(self.content, self),
+                "games": lambda: GamesPage(self.content, self),
+                "install": lambda: UnifiedInstallPage(self.content, self),
+                "usb": lambda: UsbOptimizerPage(self.content, self),
+                "opl_cfg": lambda: OplConfigPage(self.content, self),
+                "art": lambda: ArtScraperV2Page(self.content, self),
+                "mc": lambda: MemoryCardPage(self.content, self),
+                "test": lambda: EmulatorTestPage(self.content, self),
+                "iso": lambda: IsoStudioPage(self.content, self),
+                "patcher": lambda: IsoPatcherV2Page(self.content, self),
+                "pops": lambda: PopStarterPage(self.content, self),
+                "burn": lambda: DvdBurnerPage(self.content, self),
+                "rip_disc": self._build_optical_disc_page,
+                "disk_ops": self._build_disk_ops_page,
+                "cheats": lambda: CheatManagerPage(self.content, self),
+                "apps": lambda: AppsManagerPage(self.content, self),
+                "apa": self._build_apa_page,
+                "settings": lambda: SettingsPage(self.content, self),
+            },
+            aliases={"single_install": "install"}
+        )
 
         if old_cur_key in self.nav_more:
-            self.enter_more_tools()
-            self.show(old_cur_key)
+            self.enter_more_tools(play_snd=False)
+            self.show(old_cur_key, play_snd=False)
         else:
-            self.show(old_cur_key if old_cur_key else "dash")
-        self.monitor_usb()
+            self.show(old_cur_key if old_cur_key in self.pages else "dash", play_snd=False)
 
-    def _build_util_page(self):
+        if self._usb_job is None:
+            self.monitor_usb()
+
+        if self._news_overlay and self._news_overlay.winfo_exists():
+            self._news_overlay.lift()
+
+    def check_remote_news(self):
+        if self.setup_frame is not None:
+            return
+        dispatch = lambda notice: self.after(0, lambda n=notice: self._show_remote_news(n))
+        if not self._news_checked:
+            self._news_checked = True
+            RemoteNoticeClient.fetch_async(dispatch)
+        RemoteNoticeClient.start_live_watcher(self, dispatch)
+
+    def _show_remote_news(self, notice: dict):
+        if not notice or not self.winfo_exists() or (self.setup_frame is not None):
+            return
+        news_id = int(notice.get("id", 0) or 0)
+        prev_backdrop = None
+        if self._news_overlay and self._news_overlay.winfo_exists():
+            if getattr(self._news_overlay, "news_id", 0) == news_id:
+                return
+            prev_backdrop = getattr(self._news_overlay, "_base_dim_pil", None)
+            self._news_overlay.destroy()
+            self._news_overlay = None
+            self.update_idletasks()
+        try:
+            if self.state() == "iconic":
+                self.deiconify()
+                self.update()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(220, lambda: self.attributes("-topmost", False) if self.winfo_exists() else None)
+        except Exception:
+            pass
+        self._news_overlay = NewsOverlayModal(self, notice, base_dim_pil=prev_backdrop)
+
+    def _build_optical_disc_page(self):
         frm = ctk.CTkFrame(self.content, fg_color="transparent")
         frm.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(frm, text=t("tab_util"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-        card = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-        ctk.CTkLabel(card, text=t("util_iso"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
-        f_s = ctk.CTkFrame(card, fg_color="transparent"); f_s.pack(fill="x", padx=20)
-        e_s = ctk.CTkEntry(f_s, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry")); e_s.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f_s, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=lambda: [e_s.delete(0, 'end'), e_s.insert(0, filedialog.askopenfilename(filetypes=[(t("iso_files"), "*.iso")]) or "")]).pack(side="left", padx=10)
-        ctk.CTkLabel(card, text=t("util_dst"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        f_d = ctk.CTkFrame(card, fg_color="transparent"); f_d.pack(fill="x", padx=20)
-        e_d = ctk.CTkEntry(f_d, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry")); e_d.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f_d, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=lambda: [e_d.delete(0, 'end'), e_d.insert(0, filedialog.askdirectory() or "")]).pack(side="left", padx=10)
-        ctk.CTkLabel(card, text=t("util_name"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        e_n = ctk.CTkEntry(card, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry")); e_n.pack(fill="x", padx=20)
-        prog = ctk.CTkProgressBar(card, progress_color=cfg.get_color("accent")); prog.pack(fill="x", padx=20, pady=(20, 10)); prog.set(0)
-        btn = ctk.CTkButton(card, text=t("util_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"))
-        btn.pack(pady=20, padx=20, fill="x")
-        def go():
-            if not e_s.get() or not e_d.get(): return
-            btn.configure(state="disabled")
-            USBUtilWorker.split_and_generate(
-                e_s.get(), e_d.get(), e_n.get() or os.path.splitext(os.path.basename(e_s.get()))[0][:32],
-                lambda v: self.after(0, lambda: prog.set(v)),
-                lambda s: self.after(0, lambda: [btn.configure(state="normal"), sound_fx.play_success(), messagebox.showinfo(t("success"), t("util_succ"))]),
-                lambda e: self.after(0, lambda: [btn.configure(state="normal"), sound_fx.play_error(), messagebox.showerror(t("error"), str(e))])
-            )
-        btn.configure(command=go)
-        return frm
+        frm.grid_rowconfigure(2, weight=1)
+        PageHeader(frm, t("tab_rip"), "").grid(row=0, column=0, sticky="ew", pady=(0, 12))
 
-    def _build_rip_page(self):
-        frm = ctk.CTkFrame(self.content, fg_color="transparent")
-        frm.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(frm, text=t("tab_rip"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-        card = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-        ctk.CTkLabel(card, text=t("disc_drv"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
-        drvs = PhysicalDriveRipper.get_optical_drives() or [t("burn_no_drives")]
-        cmb_d = ctk.CTkComboBox(card, values=drvs, height=32, corner_radius=cfg.get_radius("entry"))
-        cmb_d.pack(fill="x", padx=20)
-        ctk.CTkLabel(card, text=t("rip_out"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        f_o = ctk.CTkFrame(card, fg_color="transparent"); f_o.pack(fill="x", padx=20)
-        e_o = ctk.CTkEntry(f_o, fg_color=cfg.get_color("bg_main"), height=32, corner_radius=cfg.get_radius("entry")); e_o.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f_o, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=lambda: [e_o.delete(0, 'end'), e_o.insert(0, filedialog.asksaveasfilename(filetypes=[(t("iso_files"), "*.iso")]) or "")]).pack(side="left", padx=10)
-        prog = ctk.CTkProgressBar(card, progress_color=cfg.get_color("accent")); prog.pack(fill="x", padx=20, pady=(20, 10)); prog.set(0)
-        btn = ctk.CTkButton(card, text=t("rip_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"))
-        btn.pack(pady=20, padx=20, fill="x")
-        def go():
-            if cmb_d.get() == t("burn_no_drives") or not e_o.get(): return
-            btn.configure(state="disabled")
-            PhysicalDriveRipper.rip_to_iso(
-                cmb_d.get(), e_o.get(),
-                lambda v: self.after(0, lambda: prog.set(v)),
-                lambda s: self.after(0, lambda: [btn.configure(state="normal"), sound_fx.play_success(), messagebox.showinfo(t("success"), t("rip_done"))]),
-                lambda e: self.after(0, lambda: [btn.configure(state="normal"), sound_fx.play_error(), messagebox.showerror(t("error"), str(e))])
-            )
-        btn.configure(command=go)
-        return frm
+        tabs = [t("tab_rip"), t("tab_disc")]
+        f_rip = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
+        f_ana = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
 
-    def _build_disc_page(self):
-        frm = ctk.CTkFrame(self.content, fg_color="transparent")
-        frm.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(frm, text=t("tab_disc"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-        card = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
+        def sw(v):
+            f_rip.grid_forget()
+            f_ana.grid_forget()
+            (f_rip if v == tabs[0] else f_ana).grid(row=2, column=0, sticky="nsew")
+
+        seg = create_segmented_tabs(frm, tabs, sw)
+        seg.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
         drvs = PhysicalDriveRipper.get_optical_drives() or [t("disc_none")]
-        cmb = ctk.CTkComboBox(card, values=drvs, height=32, corner_radius=cfg.get_radius("entry"))
-        cmb.pack(fill="x", padx=20, pady=(20, 10))
-        txt = ctk.CTkTextbox(card, font=("Consolas", 12), height=180, fg_color=cfg.get_color("bg_main"), corner_radius=cfg.get_radius("entry"))
+        ctk.CTkLabel(f_rip, text=t("disc_drv"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
+        cmb_d = ctk.CTkComboBox(f_rip, values=drvs, height=34, corner_radius=cfg.get_radius("entry"))
+        cmb_d.pack(fill="x", padx=20)
+        ctk.CTkLabel(f_rip, text=t("rip_out"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(14, 5))
+        r_o = ctk.CTkFrame(f_rip, fg_color="transparent")
+        r_o.pack(fill="x", padx=20)
+        e_o = ctk.CTkEntry(r_o, fg_color=cfg.get_color("bg_main"), height=34, corner_radius=cfg.get_radius("entry"))
+        e_o.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ctk.CTkButton(r_o, text=t("btn_browse"), width=90, height=34, corner_radius=cfg.get_radius("button"), command=lambda: [sound_fx.play_click(), e_o.delete(0, 'end'), e_o.insert(0, filedialog.asksaveasfilename(defaultextension=".iso", filetypes=[(t("iso_files"), "*.iso")]) or "")]).pack(side="left")
+        prog = ctk.CTkProgressBar(f_rip, progress_color=cfg.get_color("highlight"))
+        prog.pack(fill="x", padx=20, pady=(20, 10))
+        prog.set(0)
+        btn_r = ctk.CTkButton(f_rip, text=t("rip_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=42, corner_radius=cfg.get_radius("button"))
+        btn_r.pack(pady=(6, 20), padx=20, fill="x")
+
+        def go_rip():
+            sound_fx.play_click()
+            if cmb_d.get() == t("disc_none") or not e_o.get():
+                return
+            btn_r.configure(state="disabled")
+            PhysicalDriveRipper.rip_drive(
+                cmb_d.get(), e_o.get(), True,
+                lambda v: self.after(0, lambda: prog.set(v)),
+                lambda out_f: self.after(0, lambda: [btn_r.configure(state="normal"), sound_fx.play_success(), messagebox.showinfo(t("success"), f"{t('rip_done')}\n{out_f}")]),
+                lambda e: self.after(0, lambda: [btn_r.configure(state="normal"), sound_fx.play_error(), messagebox.showerror(t("error"), str(e))])
+            )
+        btn_r.configure(command=go_rip)
+
+        cmb_a = ctk.CTkComboBox(f_ana, values=drvs, height=34, corner_radius=cfg.get_radius("entry"))
+        cmb_a.pack(fill="x", padx=20, pady=(20, 10))
+        txt = ctk.CTkTextbox(f_ana, font=("Consolas", 12), height=190, fg_color=cfg.get_color("bg_main"), corner_radius=cfg.get_radius("entry"))
         txt.pack(fill="x", padx=20, pady=10)
-        btn = ctk.CTkButton(card, text=t("disc_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"))
-        btn.pack(pady=20, padx=20, fill="x")
-        def go():
-            if cmb.get() == t("disc_none"): return
-            txt.delete("1.0", "end"); txt.insert("end", "Analyzing optical disc sectors...\n")
+
+        def go_ana():
+            sound_fx.play_click()
+            if cmb_a.get() == t("disc_none"):
+                return
+            txt.delete("1.0", "end")
+            txt.insert("end", "Analyzing physical optical disc...\n")
+
             def r():
-                info = PhysicalDriveRipper.analyze_disc(cmb.get())
-                out = f"--- OPTICAL DISC BINARY ANALYSIS ---\nDrive:  {cmb.get()}\nStatus: {info['status']}\nVolume: {info['size_str']}\nID:     {info['game_id']}\nRegion: {info['region']}\n"
+                info = PhysicalDriveRipper.analyze_disc(cmb_a.get())
+                out = f"=== OPTICAL DISC ANALYSIS ===\nDrive  : {cmb_a.get()}\nStatus : {info['status']}\nVolume : {info['size_str']}\nGame ID: {info['game_id']}\nRegion : {info['region']}\n"
                 self.after(0, lambda: [txt.delete("1.0", "end"), txt.insert("end", out), sound_fx.play_success()])
             threading.Thread(target=r, daemon=True).start()
-        btn.configure(command=go)
+
+        ctk.CTkButton(f_ana, text=t("disc_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=42, corner_radius=cfg.get_radius("button"), command=go_ana).pack(pady=15, padx=20, fill="x")
+        sw(tabs[0])
         return frm
 
-    def _build_clone_page(self):
+    def _build_disk_ops_page(self):
         frm = ctk.CTkFrame(self.content, fg_color="transparent")
         frm.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(frm, text=t("sub_clone")[2:], font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-        card = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-        ctk.CTkLabel(card, text=t("clone_src"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
+        frm.grid_rowconfigure(2, weight=1)
+        PageHeader(frm, t("tab_mig"), "").grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+        tabs = [t("sub_clone")[2:].strip(), t("tab_mig")]
+        f_cln = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
+        f_mig = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
+
+        def sw(v):
+            f_cln.grid_forget()
+            f_mig.grid_forget()
+            (f_cln if v == tabs[0] else f_mig).grid(row=2, column=0, sticky="nsew")
+
+        create_segmented_tabs(frm, tabs, sw).grid(row=1, column=0, sticky="ew", pady=(0, 12))
         d_vals = [f"{d['device']} [{d['fstype']}]" for d in DriveManager.get_drives()] or ["None"]
-        cmb_s = ctk.CTkComboBox(card, values=d_vals, height=32, corner_radius=cfg.get_radius("entry")); cmb_s.pack(fill="x", padx=20)
-        ctk.CTkLabel(card, text=t("clone_dst"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        cmb_d = ctk.CTkComboBox(card, values=d_vals, height=32, corner_radius=cfg.get_radius("entry")); cmb_d.pack(fill="x", padx=20)
-        chk_f = ctk.CTkCheckBox(card, text=t("clone_fmt_dst"), font=("Segoe UI", 11)); chk_f.pack(anchor="w", padx=20, pady=15)
-        log_box = ctk.CTkTextbox(card, font=("Consolas", 10), height=90, fg_color=cfg.get_color("bg_main")); log_box.pack(fill="x", padx=20, pady=5)
-        btn = ctk.CTkButton(card, text=t("clone_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"))
-        btn.pack(pady=20, padx=20, fill="x")
+
+        # Clone
+        ctk.CTkLabel(f_cln, text=t("clone_src"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(18, 4))
+        cmb_s = ctk.CTkComboBox(f_cln, values=d_vals, height=34, corner_radius=cfg.get_radius("entry"))
+        cmb_s.pack(fill="x", padx=20)
+        ctk.CTkLabel(f_cln, text=t("clone_dst"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(12, 4))
+        cmb_d = ctk.CTkComboBox(f_cln, values=d_vals, height=34, corner_radius=cfg.get_radius("entry"))
+        cmb_d.pack(fill="x", padx=20)
+        chk_f = ctk.CTkCheckBox(f_cln, text=t("clone_fmt_dst"), font=("Segoe UI", 11), command=sound_fx.play_click)
+        chk_f.pack(anchor="w", padx=20, pady=12)
+        log_c = ctk.CTkTextbox(f_cln, font=("Consolas", 10), height=95, fg_color=cfg.get_color("bg_main"))
+        log_c.pack(fill="x", padx=20, pady=4)
+        prog_c = ctk.CTkProgressBar(f_cln, progress_color=cfg.get_color("highlight"))
+        prog_c.pack(fill="x", padx=20, pady=8)
+        prog_c.set(0)
+
         def run_c():
+            sound_fx.play_click()
             s_val, d_val = cmb_s.get().split(" ")[0], cmb_d.get().split(" ")[0]
-            if s_val == "None" or d_val == "None" or s_val == d_val: return
+            if s_val == "None" or d_val == "None" or s_val == d_val:
+                return
             drives = DriveManager.get_drives()
-            s_d, d_d = next((d for d in drives if d['device'] == s_val), None), next((d for d in drives if d['device'] == d_val), None)
-            w = CloneWorker(s_d, d_d, chk_f.get(), False, {'log': lambda m: self.after(0, lambda: log_box.insert("end", m + "\n")), 'prog_total': lambda v: None})
+            s_d = next((d for d in drives if d['device'] == s_val), None)
+            d_d = next((d for d in drives if d['device'] == d_val), None)
+            if not s_d or not d_d:
+                return
+            w = CloneWorker(s_d, d_d, chk_f.get(), False, {
+                'log': lambda m: self.after(0, lambda: log_c.insert("end", m + "\n")),
+                'prog_total': lambda v: self.after(0, lambda: prog_c.set(v)),
+                'done': lambda s: self.after(0, lambda: sound_fx.play_success() if s else sound_fx.play_error())
+            })
             threading.Thread(target=w.run, daemon=True).start()
-        btn.configure(command=run_c)
-        return frm
 
-    def _build_migrate_page(self):
-        frm = ctk.CTkFrame(self.content, fg_color="transparent")
-        frm.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(frm, text=t("tab_mig"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-        card = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        card.grid(row=1, column=0, sticky="nsew")
-        ctk.CTkLabel(card, text=t("mig_drv"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(20, 5))
-        d_vals = [f"{d['device']} [{d['fstype']}]" for d in DriveManager.get_drives()] or ["None"]
-        cmb_d = ctk.CTkComboBox(card, values=d_vals, height=32, corner_radius=cfg.get_radius("entry")); cmb_d.pack(fill="x", padx=20)
-        ctk.CTkLabel(card, text=t("mig_fs"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(15, 5))
-        cmb_f = ctk.CTkComboBox(card, values=["exFAT", "FAT32"], height=32, corner_radius=cfg.get_radius("entry")); cmb_f.pack(fill="x", padx=20)
-        log_box = ctk.CTkTextbox(card, font=("Consolas", 10), height=100, fg_color=cfg.get_color("bg_main")); log_box.pack(fill="x", padx=20, pady=15)
-        btn = ctk.CTkButton(card, text=t("mig_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("danger"), height=40, corner_radius=cfg.get_radius("button"))
-        btn.pack(pady=20, padx=20, fill="x")
-        def go():
-            dev = cmb_d.get().split(" ")[0]
-            drives = DriveManager.get_drives()
-            d = next((x for x in drives if x['device'] == dev), None)
-            if not d or not messagebox.askyesno(t("confirm"), t("mig_conf")): return
-            w = MigrationWorker(d, cmb_f.get(), {'log': lambda m: self.after(0, lambda: log_box.insert("end", m + "\n")), 'prog_total': lambda v: None, 'prog_step': lambda v: None, 'done': lambda s: None})
+        ctk.CTkButton(f_cln, text=t("clone_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("accent"), height=40, corner_radius=cfg.get_radius("button"), command=run_c).pack(pady=14, padx=20, fill="x")
+
+        # Migrate
+        ctk.CTkLabel(f_mig, text=t("mig_drv"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(18, 4))
+        cmb_md = ctk.CTkComboBox(f_mig, values=d_vals, height=34, corner_radius=cfg.get_radius("entry"))
+        cmb_md.pack(fill="x", padx=20)
+        ctk.CTkLabel(f_mig, text=t("mig_fs"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(12, 4))
+        cmb_mf = ctk.CTkComboBox(f_mig, values=["exFAT", "FAT32"], height=34, corner_radius=cfg.get_radius("entry"))
+        cmb_mf.pack(fill="x", padx=20)
+        log_m = ctk.CTkTextbox(f_mig, font=("Consolas", 10), height=105, fg_color=cfg.get_color("bg_main"))
+        log_m.pack(fill="x", padx=20, pady=12)
+        prog_m = ctk.CTkProgressBar(f_mig, progress_color=cfg.get_color("highlight"))
+        prog_m.pack(fill="x", padx=20, pady=4)
+        prog_m.set(0)
+
+        def run_m():
+            sound_fx.play_click()
+            dev = cmb_md.get().split(" ")[0]
+            d = next((x for x in DriveManager.get_drives() if x['device'] == dev), None)
+            if not d or not messagebox.askyesno(t("confirm"), t("mig_conf")):
+                return
+            w = MigrationWorker(d, cmb_mf.get(), {
+                'log': lambda m: self.after(0, lambda: log_m.insert("end", m + "\n")),
+                'prog_total': lambda v: self.after(0, lambda: prog_m.set(v)),
+                'prog_step': lambda v: None,
+                'done': lambda s: self.after(0, lambda: sound_fx.play_success() if s else sound_fx.play_error())
+            })
             threading.Thread(target=w.run, daemon=True).start()
-        btn.configure(command=go)
+
+        ctk.CTkButton(f_mig, text=t("mig_btn"), font=("Segoe UI", 12, "bold"), fg_color=cfg.get_color("danger"), height=40, corner_radius=cfg.get_radius("button"), command=run_m).pack(pady=14, padx=20, fill="x")
+        sw(tabs[0])
         return frm
 
     def _build_apa_page(self):
         frm = ctk.CTkFrame(self.content, fg_color="transparent")
-        frm.grid_columnconfigure(0, weight=1); frm.grid_rowconfigure(2, weight=1)
-        ctk.CTkLabel(frm, text=t("apa_title"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 15))
-        top = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
+        frm.grid_columnconfigure(0, weight=1)
+        frm.grid_rowconfigure(2, weight=1)
+        PageHeader(frm, t("apa_title"), "", badge_text="HDL / +OPL").grid(row=0, column=0, sticky="ew", pady=(0, 14))
+
+        top = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
         top.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        ctk.CTkLabel(top, text=t("apa_drv"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=15, pady=(15, 5))
-        d_vals = APAManager.list_physical_drives() or ["PhysicalDrive1", "PhysicalDrive2"]
-        cmb_p = ctk.CTkComboBox(top, values=d_vals, height=32, corner_radius=cfg.get_radius("entry")); cmb_p.pack(fill="x", padx=15, pady=5)
-        bar = ctk.CTkFrame(top, fg_color="transparent"); bar.pack(fill="x", padx=15, pady=10)
-        ctk.CTkButton(bar, text=t("apa_btn_open"), width=120, height=32, corner_radius=cfg.get_radius("button"), command=lambda: open_img()).pack(side="left", padx=4)
-        ctk.CTkButton(bar, text=t("apa_btn_raw"), width=180, height=32, corner_radius=cfg.get_radius("button"), command=lambda: dump_raw()).pack(side="left", padx=4)
-        ctk.CTkButton(bar, text=t("apa_btn_ext"), width=140, height=32, fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"), command=lambda: ext_games()).pack(side="left", padx=4)
-        list_apa = ctk.CTkScrollableFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
+        ctk.CTkLabel(top, text=t("apa_drv"), font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        d_vals = APAManager.list_physical_drives() or ["\\\\.\\PhysicalDrive1"]
+        cmb_p = ctk.CTkComboBox(top, values=d_vals, height=34, corner_radius=cfg.get_radius("entry"))
+        cmb_p.pack(fill="x", padx=16, pady=4)
+
+        prog_apa = ctk.CTkProgressBar(top, progress_color=cfg.get_color("highlight"))
+        prog_apa.pack(fill="x", padx=16, pady=(8, 4))
+        prog_apa.set(0)
+
+        bar = ctk.CTkFrame(top, fg_color="transparent")
+        bar.pack(fill="x", padx=16, pady=(6, 14))
+        list_apa = ctk.CTkScrollableFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=cfg.get_border_width(), border_color=cfg.get_color("border"))
         list_apa.grid(row=2, column=0, sticky="nsew")
-        loaded_parts = []
+
+        def render_parts(parts):
+            for w in list_apa.winfo_children():
+                w.destroy()
+            for p in parts:
+                r = ctk.CTkFrame(list_apa, fg_color=cfg.get_color("bg_main"), height=40, corner_radius=cfg.get_radius("chip"))
+                r.pack(fill="x", pady=3, padx=6)
+                r.pack_propagate(False)
+                ctk.CTkLabel(r, text=p['name'], font=("Consolas", 12, "bold"), text_color=cfg.get_color("highlight" if p['is_game'] else "accent")).pack(side="left", padx=12)
+                ctk.CTkLabel(r, text=f"{p['size_str']} • Sector {p['start']}", font=("Consolas", 10), text_color=cfg.get_color("text_muted")).pack(side="right", padx=14)
+
         def open_img():
-            f = filedialog.askopenfilename(filetypes=[("Disk Image", "*.img *.bin *.raw")])
+            sound_fx.play_click()
+            f = filedialog.askopenfilename(filetypes=[("APA Disk Image", "*.img *.bin *.raw")])
             if f:
-                parts = APAManager.read_apa_header(f)
-                loaded_parts.clear(); loaded_parts.extend(parts)
+                cmb_p.set(f)
+                parts = APAManager.read_apa_partitions(f)
+                sound_fx.play_success()
                 render_parts(parts)
+
+        def scan_drv():
+            sound_fx.play_click()
+            parts = APAManager.read_apa_partitions(cmb_p.get())
+            sound_fx.play_success() if parts else sound_fx.play_warning()
+            render_parts(parts)
+
         def dump_raw():
+            sound_fx.play_click()
             dst = filedialog.asksaveasfilename(defaultextension=".img", filetypes=[("Raw Image", "*.img")])
             if dst:
-                APAManager.dump_raw_drive(cmb_p.get(), dst, lambda m: NotificationPopup(self, m, "info"))
+                APAManager.backup_raw(
+                    cmb_p.get(), dst,
+                    cb_prog=lambda v: self.after(0, lambda: prog_apa.set(v)),
+                    cb_done=lambda _: self.after(0, lambda: [sound_fx.play_success(), NotificationPopup(self, "APA Backup saved!", "success")]),
+                    cb_err=lambda e: self.after(0, lambda: [sound_fx.play_error(), messagebox.showerror(t("error"), e)])
+                )
+
         def ext_games():
+            sound_fx.play_click()
             dst = filedialog.askdirectory()
-            if dst and loaded_parts:
-                APAManager.extract_contents(cmb_p.get(), loaded_parts, dst, lambda m: NotificationPopup(self, m, "success"))
-        def render_parts(parts):
-            for w in list_apa.winfo_children(): w.destroy()
-            for p in parts:
-                r = ctk.CTkFrame(list_apa, fg_color=cfg.get_color("bg_main"), height=36, corner_radius=6)
-                r.pack(fill="x", pady=2, padx=4); r.pack_propagate(False)
-                ctk.CTkLabel(r, text=p['name'], font=("Consolas", 11, "bold"), text_color=cfg.get_color("accent")).pack(side="left", padx=10)
-                ctk.CTkLabel(r, text=f"Start Sector: {p['start']}", font=("Consolas", 10), text_color=cfg.get_color("text_muted")).pack(side="right", padx=15)
+            if dst:
+                APAManager.extract_contents(
+                    cmb_p.get(), dst,
+                    cb_prog=lambda v: self.after(0, lambda: prog_apa.set(v)),
+                    cb_done=lambda _: self.after(0, lambda: [sound_fx.play_success(), NotificationPopup(self, t("iso_succ"), "success")]),
+                    cb_err=lambda e: self.after(0, lambda: [sound_fx.play_error(), messagebox.showerror(t("error"), e)])
+                )
+
+        ctk.CTkButton(bar, text=t("apa_btn_open"), height=34, corner_radius=cfg.get_radius("button"), command=open_img).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(bar, text=t("apa_btn_scan_drv"), height=34, fg_color=cfg.get_color("chip_bg"), corner_radius=cfg.get_radius("button"), command=scan_drv).pack(side="left", expand=True, fill="x", padx=4)
+        ctk.CTkButton(bar, text=t("apa_btn_raw"), height=34, corner_radius=cfg.get_radius("button"), command=dump_raw).pack(side="left", expand=True, fill="x", padx=4)
+        ctk.CTkButton(bar, text=t("apa_btn_ext"), height=34, fg_color=cfg.get_color("success"), corner_radius=cfg.get_radius("button"), command=ext_games).pack(side="left", expand=True, fill="x", padx=(4, 0))
         return frm
 
-    def _build_art_page(self):
-        frm = ctk.CTkFrame(self.content, fg_color="transparent")
-        frm.grid_columnconfigure(0, weight=1); frm.grid_rowconfigure(2, weight=1)
-        ctk.CTkLabel(frm, text=t("art_title"), font=("Segoe UI Black", 18), text_color=cfg.get_color("text_main")).grid(row=0, column=0, sticky="w", pady=(0, 10))
-        top = ctk.CTkFrame(frm, fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        top.grid(row=1, column=0, sticky="ew")
-        ctk.CTkLabel(top, text=t("art_desc"), font=("Segoe UI", 12), text_color=cfg.get_color("text_muted")).pack(anchor="w", padx=20, pady=(15, 10))
-        d_vals = [d['mountpoint'] for d in DriveManager.get_drives()] or ["None"]
-        f_d = ctk.CTkFrame(top, fg_color="transparent"); f_d.pack(fill="x", padx=20, pady=5)
-        cmb_d = ctk.CTkComboBox(f_d, values=d_vals, height=32, corner_radius=cfg.get_radius("entry")); cmb_d.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(f_d, text=t("btn_browse"), width=90, corner_radius=cfg.get_radius("button"), command=lambda: [cmb_d.set(filedialog.askdirectory() or cmb_d.get())]).pack(side="left", padx=10)
-        prog = ctk.CTkProgressBar(top, progress_color=cfg.get_color("accent")); prog.pack(fill="x", padx=20, pady=15); prog.set(0)
-        log_box = ctk.CTkTextbox(frm, font=("Consolas", 11), fg_color=cfg.get_color("card_base"), corner_radius=cfg.get_radius("card"), border_width=1, border_color=cfg.get_color("border"))
-        log_box.grid(row=2, column=0, sticky="nsew", pady=10)
-        btn_bar = ctk.CTkFrame(top, fg_color="transparent"); btn_bar.pack(fill="x", padx=20, pady=(0, 15))
-        det_ids = []
-        def scan_art():
-            mp = cmb_d.get()
-            if not mp or mp == "None": return
-            ids = ArtScraperWorker.scan_for_ids(mp)
-            det_ids.clear(); det_ids.extend(ids)
-            log_box.insert("end", f"Identified {len(ids)} games on storage drive.\n")
-            if ids: btn_dl.configure(state="normal")
-        def dl_art():
-            btn_dl.configure(state="disabled")
-            ArtScraperWorker.download_art(
-                cmb_d.get(), det_ids,
-                lambda v: self.after(0, lambda: prog.set(v)),
-                lambda s: self.after(0, lambda: [btn_dl.configure(state="normal"), sound_fx.play_success(), messagebox.showinfo(t("success"), t("art_done"))]),
-                lambda e: self.after(0, lambda: [btn_dl.configure(state="normal"), sound_fx.play_error(), messagebox.showerror(t("error"), e)]),
-                lambda m: self.after(0, lambda: [log_box.insert("end", m + "\n"), log_box.see("end")])
-            )
-        ctk.CTkButton(btn_bar, text=t("art_scan"), font=("Segoe UI", 11, "bold"), fg_color=cfg.get_color("accent"), height=36, corner_radius=cfg.get_radius("button"), command=scan_art).pack(side="left", expand=True, padx=4)
-        btn_dl = ctk.CTkButton(btn_bar, text=t("art_dl"), font=("Segoe UI", 11, "bold"), fg_color=cfg.get_color("success"), height=36, corner_radius=cfg.get_radius("button"), state="disabled", command=dl_art)
-        btn_dl.pack(side="left", expand=True, padx=4)
-        return frm
-
-    def enter_more_tools(self):
+    def enter_more_tools(self, play_snd=True):
+        if play_snd:
+            sound_fx.play_tab()
+        self.lbl_sec.configure(text=t("nav_sec_tools"))
         for k in self.nav_main:
             self.btns[k].grid_remove()
         self.btn_enter_more.grid_remove()
-        self.btn_back_more.grid(row=1, column=0, padx=12, pady=(10, 15), sticky="ew")
+        self.btn_back_more.grid(row=2, column=0, padx=12, pady=(4, 10), sticky="ew")
         for i, k in enumerate(self.nav_more):
-            self.btns[k].grid(row=2 + i, column=0, padx=12, pady=2, sticky="ew")
-        self.show(self.nav_more[0])
+            self.btns[k].grid(row=3 + i, column=0, padx=12, pady=2, sticky="ew")
+        if play_snd:
+            self.show(self.nav_more[0], play_snd=False)
 
     def exit_more_tools(self):
+        sound_fx.play_tab()
+        self.lbl_sec.configure(text=t("nav_sec_main"))
         self.btn_back_more.grid_remove()
         for k in self.nav_more:
             self.btns[k].grid_remove()
         for k in self.nav_main:
             self.btns[k].grid()
         self.btn_enter_more.grid()
-        self.show("dash")
+        self.show("dash", play_snd=False)
 
-    def show(self, k):
-        if self.cur == self.pages.get(k):
+    def show(self, k, play_snd=True):
+        target_page = self.pages.get(k)
+        if not target_page or self.cur == target_page:
             return
-        sound_fx.play_tab()
+
+        if play_snd:
+            sound_fx.play_tab()
+
+        if self._anim_job:
+            try:
+                self.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
+
         self.library.sync_drives()
-        for b in self.btns.values():
-            b.configure(fg_color="transparent", text_color=cfg.get_color("text_muted"))
-        if k in self.btns:
-            self.btns[k].configure(fg_color=cfg.get_color("card_base"), text_color=cfg.get_color("text_main"))
+        nav_key = "install" if k == "single_install" else k
+        for b_key, b in self.btns.items():
+            if b_key == nav_key:
+                b.configure(fg_color=cfg.get_color("accent"), text_color="#FFFFFF")
+            else:
+                b.configure(fg_color="transparent", text_color=cfg.get_color("text_muted"))
+
         if self.cur:
             self.cur.place_forget()
-        self.cur = self.pages.get(k)
-        if self.cur:
+
+        self.cur = target_page
+        self.cur_key = nav_key
+        getattr(self.cur, "refresh", lambda: None)()
+
+        # Modo Batata ou animações desligadas: exibição plana instantânea (0 ms)
+        if cfg.is_potato() or not cfg.data.get("animations", True):
             self.cur.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
-            getattr(self.cur, "refresh", lambda: None)()
+            return
+
+        style = cfg.data.get("anim_style", "Slide")
+        steps = 8 if style != "Step" else 2
+
+        def animate_frame(step_i):
+            prog = step_i / steps
+            ease = 1.0 - ((1.0 - prog) ** 3)  # Cubic ease-out suave a 60fps
+            if step_i >= steps:
+                self.cur.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
+                self._anim_job = None
+                return
+            if style == "Slide":
+                rx = 0.055 * (1.0 - ease)
+                self.cur.place(relx=rx, rely=0.0, relwidth=1.0, relheight=1.0)
+            elif style == "Rise":
+                ry = 0.05 * (1.0 - ease)
+                self.cur.place(relx=0.0, rely=ry, relwidth=1.0, relheight=1.0)
+            elif style == "Zoom":
+                sc = 0.94 + (0.06 * ease)
+                off = (1.0 - sc) / 2.0
+                self.cur.place(relx=off, rely=off, relwidth=sc, relheight=sc)
+            else:  # Step
+                rx = 0.02 * (1.0 - ease)
+                self.cur.place(relx=rx, rely=0.0, relwidth=1.0, relheight=1.0)
+            self._anim_job = self.after(15, lambda: animate_frame(step_i + 1))
+
+        animate_frame(1)
 
     def refresh_all_ui(self):
         cfg.apply_theme()
@@ -1975,11 +1551,11 @@ class MainApp(ctk.CTk):
             self.build_main_ui()
 
     def on_closing(self):
-        # Intercepta Alt+F4 ou botão fechar se houver processos/cópias ativas
         if TransferLockManager.is_busy() or self.active_transfers > 0:
             sound_fx.play_error()
             messagebox.showwarning(t("warning"), t("msg_corruption_warn"))
             return
+        sound_fx.play_close()
         self.destroy()
         sys.exit(0)
 
@@ -1988,29 +1564,55 @@ class MainApp(ctk.CTk):
         if os.path.exists(lock_file):
             sound_fx.play_warning()
             if messagebox.askyesno(t("recovery_title"), t("recovery_msg")):
-                try: os.remove(lock_file)
-                except Exception: pass
-                self.show("batch")
+                try:
+                    os.remove(lock_file)
+                except Exception:
+                    pass
+                self.show("install")
             else:
-                try: os.remove(lock_file)
-                except Exception: pass
+                try:
+                    os.remove(lock_file)
+                except Exception:
+                    pass
 
     def refresh_all(self):
-        for p in self.pages.values():
+        active_pages = self.pages.instantiated() if hasattr(self.pages, "instantiated") else list(set(self.pages.values()))
+        for p in active_pages:
             getattr(p, "refresh", lambda: None)()
 
-    def monitor_usb(self):
+    def _apply_usb_count(self, c: int):
         try:
-            d = UsbDetector.get_removable_drives()
-            c = len(d)
+            if not self.winfo_exists():
+                return
             if self.last_usb != -1 and c != self.last_usb:
-                sound_fx.play_usb()
-                self.library.sync_drives()
+                sound_fx.play_usb(connected=(c > self.last_usb))
+                if c > self.last_usb:
+                    NotificationPopup(self, t("notif_usb_connected"), "info")
+                self.library.sync_drives(force=True)
                 self.refresh_all()
             self.last_usb = c
         except Exception:
             pass
-        self.after(3000, self.monitor_usb)
+
+    def monitor_usb(self):
+        if not self._usb_probing and not TransferLockManager.is_busy():
+            self._usb_probing = True
+
+            def _probe():
+                try:
+                    c = len(UsbDetector.get_removable_drives(force=True))
+                    if self.winfo_exists():
+                        self.after(0, lambda cnt=c: self._apply_usb_count(cnt))
+                except Exception:
+                    pass
+                finally:
+                    self._usb_probing = False
+
+            threading.Thread(target=_probe, daemon=True).start()
+
+        interval = 8000 if cfg.is_potato() else 3500
+        self._usb_job = self.after(interval, self.monitor_usb)
+
 
 if __name__ == "__main__":
     app = MainApp()

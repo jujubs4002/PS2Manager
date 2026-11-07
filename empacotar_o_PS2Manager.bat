@@ -3,10 +3,30 @@ py -m PyInstaller ^
   --onefile ^
   --windowed ^
   --icon "icon.ico" ^
+  --version-file "version_info.txt" ^
+  --add-data "icon.ico;." ^
+  --add-data "version.txt;." ^
   --add-data "sounds;sounds" ^
   --add-data "scripts;scripts" ^
   --copy-metadata customtkinter ^
   --hidden-import pygame ^
   --hidden-import customtkinter ^
   --hidden-import psutil ^
+  --hidden-import PIL ^
+  --hidden-import PIL.Image ^
+  --hidden-import PIL.ImageDraw ^
+  --hidden-import PIL.ImageFont ^
+  --hidden-import PIL.ImageFilter ^
+  --hidden-import PIL.ImageTk ^
+  --hidden-import PIL.ImageEnhance ^
+  --hidden-import PIL._tkinter_finder ^
+  --hidden-import requests ^
+  --hidden-import lz4 ^
+  --hidden-import lz4.block ^
+  --hidden-import pycdlib ^
+  --hidden-import scripts.core_backend ^
+  --hidden-import scripts.tool_workers ^
+  --hidden-import scripts.v108_workers ^
+  --hidden-import scripts.ui_pages ^
+  --hidden-import scripts.ui_modals ^
   --name "PS2Manager" ps2manager.py

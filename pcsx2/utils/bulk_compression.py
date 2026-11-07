@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 
 # PCSX2 - PS2 Emulator for PCs
